@@ -18,3 +18,6 @@ def test_launcher_and_desktop_shortcut_use_docmarshal_branding():
     assert '"DocMarshal"' in launcher
     assert "DocMarshal.lnk" in shortcut
     assert "docmarshal.ico" in shortcut
+    assert "Little B's DOT Document Review.lnk" in shortcut
+    assert "Launch DOT Document Review.lnk" in shortcut
+    assert "ie4uinit.exe" in shortcut
