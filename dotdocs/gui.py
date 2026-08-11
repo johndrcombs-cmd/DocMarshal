@@ -5,15 +5,39 @@ import os
 import queue
 import threading
 import ctypes
+import base64
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .assets import ASSET_OWNERS, AssetValidationError, register_manual_asset
+from .binder import (
+    BINDER_SECTIONS,
+    advance_binder_position,
+    list_binder_documents,
+    list_binders,
+    render_binder_page,
+)
+from .database import (
+    EDITABLE_UNIT_FIELDS,
+    add_custom_field,
+    export_fleet_workbook,
+    list_custom_fields,
+    list_unit_records,
+    merge_fleet_workbook,
+    update_unit_record,
+)
 from .gui_model import ReviewModel
+from .document_import import (
+    find_tesseract,
+    import_pdf_documents,
+    ocr_candidate_paths,
+    run_pdf_ocr,
+)
 from .naming import DOCUMENT_TYPE_CHOICES
 from .processor import analyze_pdf
+from .settings import SETTING_DEFINITIONS, save_user_settings
 from .review import (
     ApprovalError,
     ReviewValidationError,
@@ -62,9 +86,10 @@ DISPLAY_ACRONYMS = {"DOT", "PDF", "VIN", "OCR", "ID", "RP", "REG", "INS"}
 
 
 class DotReviewApp:
-    def __init__(self, root: tk.Tk, config: dict):
+    def __init__(self, root: tk.Tk, config: dict, config_path: str | Path | None = None):
         self.root = root
         self.config = config
+        self.config_path = Path(config_path) if config_path is not None else None
         self.incoming = Path(config["scan_incoming"])
         self.processed = Path(config["scan_processed"])
         self.exceptions = Path(config["scan_exceptions"])
@@ -80,6 +105,7 @@ class DotReviewApp:
         self.events: queue.Queue = queue.Queue()
         self.row_sources: dict[str, str] = {}
         self.scanning = False
+        self.ocr_running = False
         self.session_load_error = None
 
         initial_results = []
@@ -92,8 +118,8 @@ class DotReviewApp:
         self.model = ReviewModel(initial_results)
 
         self.root.title(APP_NAME)
-        self.root.geometry("1440x900")
-        self.root.minsize(1180, 900)
+        self.root.geometry("1440x1000")
+        self.root.minsize(1180, 1000)
         self.root.configure(background=DARK_THEME["window"])
         self._apply_app_icon()
         self._build_ui()
@@ -362,6 +388,26 @@ class DotReviewApp:
                 background=[("active", theme["border"]), ("pressed", theme["accent"])],
             )
         style.configure("TPanedwindow", background=theme["window"], sashwidth=8)
+        style.configure(
+            "TNotebook",
+            background=theme["window"],
+            bordercolor=theme["border"],
+            tabmargins=(0, 0, 0, 0),
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=theme["surface"],
+            foreground=theme["muted"],
+            bordercolor=theme["border"],
+            padding=(22, 10),
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", theme["surface_hover"]), ("active", theme["border"])],
+            foreground=[("selected", theme["text"]), ("active", theme["text"])],
+            bordercolor=[("selected", theme["accent"])],
+        )
         return style
 
     def _build_ui(self) -> None:
@@ -387,7 +433,19 @@ class DotReviewApp:
         )
         self.scan_button.pack(side="right", padx=(12, 0))
 
-        counters = ttk.Frame(self.root)
+        self.navigation = ttk.Notebook(self.root)
+        self.navigation.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.sort_tab = ttk.Frame(self.navigation)
+        self.database_tab = ttk.Frame(self.navigation)
+        self.settings_tab = ttk.Frame(self.navigation)
+        self.binder_tab = ttk.Frame(self.navigation)
+        self.navigation.add(self.sort_tab, text="Sort")
+        self.navigation.add(self.database_tab, text="Database")
+        self.navigation.add(self.settings_tab, text="Settings")
+        self.navigation.add(self.binder_tab, text="Virtual Binder")
+        self.navigation.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        counters = ttk.Frame(self.sort_tab)
         counters.pack(fill="x", padx=16, pady=(0, 10))
         self.count_labels = {}
         for key, title in (
@@ -403,14 +461,20 @@ class DotReviewApp:
             label.pack(side="left", fill="x", expand=True, padx=(0, 8 if key != "not_dot" else 0))
             self.count_labels[key] = (label, title)
 
-        progress_frame = ttk.Frame(self.root, style="Glass.TFrame", padding=(14, 9))
+        progress_frame = ttk.Frame(self.sort_tab, style="Glass.TFrame", padding=(14, 9))
         progress_frame.pack(fill="x", padx=16, pady=(0, 10))
         self.progress = ttk.Progressbar(progress_frame, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True)
         self.progress_text = ttk.Label(progress_frame, text="Ready", style="Glass.TLabel")
         self.progress_text.pack(side="left", padx=(10, 0))
+        self.bulk_ocr_button = ttk.Button(
+            progress_frame,
+            text="Run OCR on All Needing OCR",
+            command=self.run_ocr_on_all,
+        )
+        self.bulk_ocr_button.pack(side="right", padx=(12, 0))
 
-        toolbar = ttk.Frame(self.root, style="Glass.TFrame", padding=(12, 10))
+        toolbar = ttk.Frame(self.sort_tab, style="Glass.TFrame", padding=(12, 10))
         toolbar.pack(fill="x", padx=16, pady=(0, 10))
         ttk.Label(toolbar, text="Show Documents", style="Field.TLabel").pack(side="left")
         self.filter_var = tk.StringVar(value="Active")
@@ -423,16 +487,20 @@ class DotReviewApp:
         )
         filter_box.pack(side="left", padx=(6, 12))
         filter_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_table())
+        self.import_button = ttk.Button(toolbar, text="Import PDFs", command=self.import_documents)
+        self.import_button.pack(side="left", padx=3)
+        self.ocr_button = ttk.Button(toolbar, text="Run OCR on Selected", command=self.run_ocr_on_selected)
+        self.ocr_button.pack(side="left", padx=3)
         ttk.Button(toolbar, text="Open PDF", command=self.open_pdf).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="Open Destination Folder", command=self.open_destination).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Open Destination", command=self.open_destination).pack(side="left", padx=3)
         ttk.Button(toolbar, text="Add New Asset", command=self.add_new_asset).pack(side="left", padx=(14, 3))
-        ttk.Button(toolbar, text="Restore to Active", command=self.restore_selected).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Restore Active", command=self.restore_selected).pack(side="left", padx=3)
 
-        pane = ttk.Panedwindow(self.root, orient="vertical")
+        pane = ttk.Panedwindow(self.sort_tab, orient="vertical")
         pane.pack(fill="both", expand=True, padx=16, pady=(0, 10))
 
         table_frame = ttk.Frame(pane, style="Glass.TFrame", padding=1)
-        pane.add(table_frame, weight=3)
+        pane.add(table_frame, weight=1)
         columns = ("file", "status", "unit", "owner", "type", "date", "filename", "reason")
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         headings = {
@@ -478,7 +546,7 @@ class DotReviewApp:
             style="Glass.TLabelframe",
             padding=(14, 12),
         )
-        pane.add(review_panel, weight=1)
+        pane.add(review_panel, weight=4)
         self.unit_var = tk.StringVar()
         self.type_var = tk.StringVar()
         self.date_var = tk.StringVar()
@@ -534,8 +602,592 @@ class DotReviewApp:
         review_panel.columnconfigure(2, weight=1)
 
         self.status_var = tk.StringVar(value="Ready. Click Scan Incoming Documents to analyze PDFs.")
-        ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w").pack(
-            fill="x", padx=16, pady=(0, 16)
+        ttk.Label(self.sort_tab, textvariable=self.status_var, style="Status.TLabel", anchor="w").pack(
+            side="bottom", fill="x", padx=16, pady=(0, 10), before=pane
+        )
+
+        self._build_database_tab()
+        self._build_settings_tab()
+        self._build_binder_tab()
+
+    def _on_tab_changed(self, _event=None) -> None:
+        selected = self.navigation.select()
+        if selected == str(self.database_tab):
+            self._refresh_database_table()
+        elif selected == str(self.binder_tab):
+            self._refresh_binder_shelf()
+
+    def _build_database_tab(self) -> None:
+        toolbar = ttk.Frame(self.database_tab, style="Glass.TFrame", padding=(12, 10))
+        toolbar.pack(fill="x", padx=12, pady=(12, 8))
+        ttk.Label(toolbar, text="Search Assets", style="Field.TLabel").pack(side="left")
+        self.database_search_var = tk.StringVar()
+        search = ttk.Entry(toolbar, textvariable=self.database_search_var, width=28)
+        search.pack(side="left", padx=(8, 10))
+        search.bind("<Return>", lambda _event: self._refresh_database_table())
+        ttk.Button(toolbar, text="Search", command=self._refresh_database_table).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Refresh", command=self._refresh_database_table).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Add Trackable Field", command=self._add_database_field).pack(side="right", padx=3)
+        ttk.Button(toolbar, text="Export XLSX", command=self._export_database).pack(side="right", padx=3)
+        ttk.Button(toolbar, text="Import XLSX", command=self._import_database).pack(side="right", padx=3)
+
+        pane = ttk.Panedwindow(self.database_tab, orient="vertical")
+        pane.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        table_frame = ttk.Frame(pane, style="Glass.TFrame", padding=1)
+        editor = ttk.LabelFrame(
+            pane,
+            text="Edit Selected Asset",
+            style="Glass.TLabelframe",
+            padding=(12, 10),
+        )
+        pane.add(table_frame, weight=2)
+        pane.add(editor, weight=2)
+
+        columns = ("unit", "owner", "type", "year", "make", "model", "plate", "vin", "dot")
+        self.database_table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        headings = {
+            "unit": "Unit", "owner": "Ownership", "type": "Unit Type", "year": "Year",
+            "make": "Make", "model": "Model", "plate": "Plate / Tag", "vin": "VIN / Serial",
+            "dot": "DOT Status",
+        }
+        widths = {"unit": 70, "owner": 125, "type": 100, "year": 65, "make": 110, "model": 120, "plate": 100, "vin": 180, "dot": 100}
+        for column in columns:
+            self.database_table.heading(column, text=headings[column])
+            self.database_table.column(column, width=widths[column], minwidth=widths[column], anchor="w")
+        db_vertical = ttk.Scrollbar(table_frame, orient="vertical", command=self.database_table.yview)
+        db_horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.database_table.xview)
+        self.database_table.configure(yscrollcommand=db_vertical.set, xscrollcommand=db_horizontal.set)
+        self.database_table.grid(row=0, column=0, sticky="nsew")
+        db_vertical.grid(row=0, column=1, sticky="ns")
+        db_horizontal.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.database_table.bind("<<TreeviewSelect>>", self._on_database_selection)
+
+        self.database_field_definitions = (
+            ("display_unit", "Unit Number"), ("asset_owner", "Ownership"),
+            ("unit_type", "Unit Type"), ("year", "Year"),
+            ("make", "Make"), ("model", "Model"),
+            ("vehicle_type", "Vehicle / Equipment Type"), ("plate", "Plate / Tag"),
+            ("vin", "VIN / Serial Number"), ("fuel_type", "Fuel Type"),
+            ("next_dot", "Next DOT"), ("dot_status", "DOT Status"),
+        )
+        self.database_field_vars = {}
+        for index, (field, label) in enumerate(self.database_field_definitions):
+            row = (index // 4) * 2
+            column = (index % 4) * 2
+            ttk.Label(editor, text=label, style="Field.TLabel").grid(row=row, column=column, sticky="w", padx=(0, 6), pady=(0, 2))
+            variable = tk.StringVar()
+            self.database_field_vars[field] = variable
+            if field == "asset_owner":
+                widget = ttk.Combobox(editor, textvariable=variable, values=("", *ASSET_OWNERS), state="readonly", width=20)
+            else:
+                widget = ttk.Entry(editor, textvariable=variable, width=22)
+            widget.grid(row=row + 1, column=column, columnspan=2, sticky="ew", padx=(0, 12), pady=(0, 7))
+        for column in range(8):
+            editor.columnconfigure(column, weight=1)
+        self.database_custom_frame = ttk.Frame(editor, style="GlassContent.TFrame")
+        self.database_custom_frame.grid(row=6, column=0, columnspan=8, sticky="ew", pady=(2, 0))
+        self.database_custom_vars: dict[int, tk.StringVar] = {}
+        actions = ttk.Frame(editor, style="GlassContent.TFrame")
+        actions.grid(row=8, column=0, columnspan=8, sticky="e", pady=(8, 0))
+        ttk.Button(actions, text="Save Asset Updates", command=self._save_database_record, style="Primary.TButton").pack(side="left")
+        self.database_status_var = tk.StringVar(value="Select an asset to view or edit its database record.")
+        ttk.Label(self.database_tab, textvariable=self.database_status_var, style="Status.TLabel", anchor="w").pack(
+            side="bottom", fill="x", padx=12, pady=(0, 8), before=pane
+        )
+        self.database_rows: dict[str, int] = {}
+
+    def _refresh_database_table(self) -> None:
+        if not hasattr(self, "database_table"):
+            return
+        self.database_table.delete(*self.database_table.get_children())
+        self.database_rows.clear()
+        try:
+            records = list_unit_records(self.database, self.database_search_var.get())
+        except Exception as error:
+            self.database_status_var.set(f"Database unavailable: {error}")
+            return
+        for record in records:
+            item_id = f"asset-{record['id']}"
+            self.database_table.insert(
+                "", "end", iid=item_id,
+                values=(record["display_unit"] or "", record["asset_owner"] or "", record["unit_type"] or "", record["year"] or "",
+                        record["make"] or "", record["model"] or "", record["plate"] or "", record["vin"] or "", record["dot_status"] or ""),
+            )
+            self.database_rows[item_id] = record["id"]
+        self.database_status_var.set(f"{len(records)} asset record(s). Select one to edit.")
+
+    def _selected_database_id(self) -> int | None:
+        selected = self.database_table.selection()
+        return self.database_rows.get(selected[0]) if selected else None
+
+    def _on_database_selection(self, _event=None) -> None:
+        unit_id = self._selected_database_id()
+        if unit_id is None:
+            return
+        try:
+            record = next(item for item in list_unit_records(self.database) if item["id"] == unit_id)
+            fields = list_custom_fields(self.database)
+        except Exception as error:
+            self.database_status_var.set(f"Asset could not be loaded: {error}")
+            return
+        for field, _label in self.database_field_definitions:
+            self.database_field_vars[field].set(record.get(field) or "")
+        for child in self.database_custom_frame.winfo_children():
+            child.destroy()
+        self.database_custom_vars.clear()
+        for index, field in enumerate(fields):
+            column = (index % 4) * 2
+            row = (index // 4) * 2
+            label = f"{field['name']} ({field['field_type'].replace('_', '/')})"
+            ttk.Label(self.database_custom_frame, text=label, style="Field.TLabel").grid(row=row, column=column, sticky="w", padx=(0, 6))
+            variable = tk.StringVar(value=record["custom_values"].get(field["id"], ""))
+            self.database_custom_vars[field["id"]] = variable
+            ttk.Entry(self.database_custom_frame, textvariable=variable).grid(
+                row=row + 1, column=column, columnspan=2, sticky="ew", padx=(0, 12), pady=(0, 6)
+            )
+        for column in range(8):
+            self.database_custom_frame.columnconfigure(column, weight=1)
+        self.database_status_var.set(f"Editing unit {record['display_unit']}.")
+
+    def _save_database_record(self) -> None:
+        unit_id = self._selected_database_id()
+        if unit_id is None:
+            messagebox.showinfo("Select an asset", "Select an asset record to update.")
+            return
+        try:
+            updated = update_unit_record(
+                self.database,
+                unit_id,
+                {field: variable.get() for field, variable in self.database_field_vars.items()},
+                {field_id: variable.get() for field_id, variable in self.database_custom_vars.items()},
+            )
+        except Exception as error:
+            messagebox.showerror("Asset update failed", str(error))
+            return
+        self._refresh_database_table()
+        item_id = f"asset-{unit_id}"
+        if self.database_table.exists(item_id):
+            self.database_table.selection_set(item_id)
+            self.database_table.see(item_id)
+            self._on_database_selection()
+        self.database_status_var.set(f"Updated unit {updated['display_unit']}.")
+
+    def _add_database_field(self) -> None:
+        name = simpledialog.askstring("Add Trackable Field", "Field name:", parent=self.root)
+        if not name:
+            return
+        field_type = simpledialog.askstring(
+            "Trackable Field Type",
+            "Type: text, date, number, or yes_no",
+            initialvalue="text",
+            parent=self.root,
+        )
+        if not field_type:
+            return
+        try:
+            field = add_custom_field(self.database, name, field_type)
+        except Exception as error:
+            messagebox.showerror("Field not added", str(error))
+            return
+        self.database_status_var.set(f"Added trackable field: {field['name']}.")
+        self._on_database_selection()
+
+    def _import_database(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Import Fleet Assets",
+            filetypes=(("Excel workbook", "*.xlsx"),),
+            parent=self.root,
+        )
+        if not path:
+            return
+        if not messagebox.askyesno(
+            "Merge fleet workbook",
+            "Validated rows will update matching unit numbers and add new units. The import is cancelled if an identifier conflict is found. Continue?",
+            parent=self.root,
+            icon="warning",
+        ):
+            return
+        try:
+            summary = merge_fleet_workbook(path, self.database)
+        except Exception as error:
+            messagebox.showerror("Import cancelled", str(error))
+            return
+        self._refresh_database_table()
+        self.database_status_var.set(
+            f"Import complete: {summary['updated']} updated, {summary['inserted']} added, "
+            f"{summary['custom_fields_added']} trackable field(s) added."
+        )
+
+    def _export_database(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Export Complete Fleet Database",
+            defaultextension=".xlsx",
+            filetypes=(("Excel workbook", "*.xlsx"),),
+            initialfile=f"DocMarshal-Fleet-{datetime.now():%Y-%m-%d}.xlsx",
+            parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            export_fleet_workbook(self.database, path)
+        except Exception as error:
+            messagebox.showerror("Export failed", str(error))
+            return
+        self.database_status_var.set(f"Complete database exported to {path}")
+
+    def _build_settings_tab(self) -> None:
+        panel = ttk.LabelFrame(
+            self.settings_tab,
+            text="Installation and Folder Settings",
+            style="Glass.TLabelframe",
+            padding=(18, 14),
+        )
+        panel.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(
+            panel,
+            text="Choose paths for this DocMarshal installation. Saved changes take effect after restarting the app.",
+            style="Glass.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        self.settings_vars = {}
+        for row, definition in enumerate(SETTING_DEFINITIONS, start=1):
+            ttk.Label(panel, text=definition["label"], style="Field.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+            variable = tk.StringVar(value=str(self.config.get(definition["key"], "")))
+            self.settings_vars[definition["key"]] = variable
+            ttk.Entry(panel, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=5)
+            ttk.Button(
+                panel,
+                text="Browse…",
+                command=lambda item=definition: self._browse_setting(item),
+            ).grid(row=row, column=2, padx=(8, 0), pady=5)
+        panel.columnconfigure(1, weight=1)
+        ttk.Button(panel, text="Save Settings", command=self._save_settings, style="Primary.TButton").grid(
+            row=len(SETTING_DEFINITIONS) + 1, column=2, sticky="e", pady=(14, 0)
+        )
+        self.settings_status_var = tk.StringVar(value="Settings are stored locally in config.json and are not published.")
+        ttk.Label(panel, textvariable=self.settings_status_var, style="Status.TLabel", anchor="w").grid(
+            row=len(SETTING_DEFINITIONS) + 2, column=0, columnspan=3, sticky="ew", pady=(14, 0)
+        )
+
+    def _browse_setting(self, definition: dict) -> None:
+        current = self.settings_vars[definition["key"]].get()
+        if definition["kind"] == "directory":
+            selected = filedialog.askdirectory(title=definition["label"], initialdir=current or None, parent=self.root)
+        else:
+            selected = filedialog.askopenfilename(title=definition["label"], initialfile=Path(current).name if current else None, parent=self.root)
+        if selected:
+            self.settings_vars[definition["key"]].set(selected)
+
+    def _save_settings(self) -> None:
+        if self.config_path is None:
+            messagebox.showerror("Settings unavailable", "This DocMarshal instance was not launched from a configuration file.")
+            return
+        try:
+            self.config = save_user_settings(
+                self.config_path,
+                self.config,
+                {key: variable.get() for key, variable in self.settings_vars.items()},
+            )
+        except Exception as error:
+            messagebox.showerror("Settings not saved", str(error))
+            return
+        self.settings_status_var.set("Settings saved. Restart DocMarshal to apply the updated paths safely.")
+
+    def _build_binder_tab(self) -> None:
+        pane = ttk.Panedwindow(self.binder_tab, orient="horizontal")
+        pane.pack(fill="both", expand=True, padx=12, pady=12)
+        shelf = ttk.LabelFrame(pane, text="Digital Binder Shelf", style="Glass.TLabelframe", padding=(8, 8))
+        viewer = ttk.LabelFrame(pane, text="Binder Viewer", style="Glass.TLabelframe", padding=(10, 10))
+        pane.add(shelf, weight=1)
+        pane.add(viewer, weight=4)
+        shelf_toolbar = ttk.Frame(shelf, style="GlassContent.TFrame")
+        shelf_toolbar.pack(fill="x", pady=(0, 8))
+        self.binder_filter_var = tk.StringVar()
+        binder_filter = ttk.Entry(shelf_toolbar, textvariable=self.binder_filter_var, width=12)
+        binder_filter.pack(side="left", fill="x", expand=True)
+        binder_filter.bind("<Return>", lambda _event: self._refresh_binder_shelf())
+        ttk.Button(shelf_toolbar, text="Find Unit", command=self._refresh_binder_shelf).pack(side="left", padx=(6, 0))
+        shelf_frame = ttk.Frame(shelf, style="GlassContent.TFrame")
+        shelf_frame.pack(fill="both", expand=True)
+        self.binder_shelf = tk.Canvas(
+            shelf_frame,
+            width=230,
+            background=DARK_THEME["input"],
+            highlightbackground=DARK_THEME["border"],
+            highlightthickness=1,
+        )
+        shelf_scroll = ttk.Scrollbar(shelf_frame, orient="vertical", command=self.binder_shelf.yview)
+        self.binder_shelf.configure(yscrollcommand=shelf_scroll.set)
+        self.binder_shelf.pack(side="left", fill="both", expand=True)
+        shelf_scroll.pack(side="right", fill="y")
+        self.binder_shelf.bind("<Button-1>", self._select_binder_from_shelf)
+
+        self.binder_title_var = tk.StringVar(value="Select a binder from the shelf")
+        ttk.Label(viewer, textvariable=self.binder_title_var, style="Header.TLabel").pack(anchor="w", pady=(0, 8))
+        document_bar = ttk.Frame(viewer, style="GlassContent.TFrame")
+        document_bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(document_bar, text="Document", style="Field.TLabel").pack(side="left")
+        self.binder_document_var = tk.StringVar()
+        self.binder_document_box = ttk.Combobox(document_bar, textvariable=self.binder_document_var, state="readonly")
+        self.binder_document_box.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.binder_document_box.bind("<<ComboboxSelected>>", lambda _event: self._select_binder_document())
+        ttk.Button(document_bar, text="Zoom Out", command=lambda: self._change_binder_zoom(-0.25)).pack(side="left", padx=(10, 3))
+        self.binder_zoom_var = tk.StringVar(value="100%")
+        ttk.Label(document_bar, textvariable=self.binder_zoom_var, style="Glass.TLabel", width=6, anchor="center").pack(side="left")
+        ttk.Button(document_bar, text="Fit Page", command=self._fit_binder_page).pack(side="left", padx=3)
+        ttk.Button(document_bar, text="Zoom In", command=lambda: self._change_binder_zoom(0.25)).pack(side="left", padx=3)
+
+        page_area = ttk.Frame(viewer, style="GlassContent.TFrame")
+        page_area.pack(fill="both", expand=True)
+        canvas_frame = ttk.Frame(page_area, style="GlassContent.TFrame")
+        canvas_frame.pack(side="left", fill="both", expand=True)
+        self.binder_page_canvas = tk.Canvas(
+            canvas_frame,
+            background=DARK_THEME["input"],
+            highlightbackground=DARK_THEME["border"],
+            highlightthickness=1,
+        )
+        binder_vertical = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.binder_page_canvas.yview)
+        binder_horizontal = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.binder_page_canvas.xview)
+        self.binder_page_canvas.configure(
+            yscrollcommand=binder_vertical.set,
+            xscrollcommand=binder_horizontal.set,
+        )
+        self.binder_page_canvas.grid(row=0, column=0, sticky="nsew")
+        binder_vertical.grid(row=0, column=1, sticky="ns")
+        binder_horizontal.grid(row=1, column=0, sticky="ew")
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+        self._set_binder_page_message("Choose a binder tab and PDF to view one page at a time.")
+        tabs = ttk.Frame(page_area, style="GlassContent.TFrame")
+        tabs.pack(side="right", fill="y", padx=(10, 0))
+        self.binder_section_buttons = []
+        for label, folder in BINDER_SECTIONS:
+            button = ttk.Button(tabs, text=label, command=lambda selected=folder: self._open_binder_section(selected))
+            button.pack(fill="x", pady=(0, 8))
+            self.binder_section_buttons.append(button)
+
+        navigation = ttk.Frame(viewer, style="GlassContent.TFrame")
+        navigation.pack(fill="x", pady=(8, 0))
+        ttk.Button(navigation, text="‹ Previous Page", command=lambda: self._turn_binder_page(-1)).pack(side="left")
+        self.binder_page_status_var = tk.StringVar(value="No document selected")
+        ttk.Label(navigation, textvariable=self.binder_page_status_var, style="Glass.TLabel").pack(side="left", expand=True)
+        ttk.Button(navigation, text="Next Page ›", command=lambda: self._turn_binder_page(1)).pack(side="right")
+        self.binder_records: list[dict] = []
+        self.active_binder: dict | None = None
+        self.active_binder_section: str | None = None
+        self.binder_document_paths: dict[str, Path] = {}
+        self.active_binder_pdf: Path | None = None
+        self.binder_page_index = 0
+        self.binder_page_count = 0
+        self.binder_page_image = None
+        self.binder_zoom_factor = 1.0
+
+    def _refresh_binder_shelf(self) -> None:
+        if not hasattr(self, "binder_shelf"):
+            return
+        self.binder_shelf.delete("all")
+        try:
+            all_records = list_binders(self.database, self.unit_root, self.farm_unit_root)
+        except Exception as error:
+            self.binder_page_status_var.set(f"Binder shelf unavailable: {error}")
+            self.binder_records = []
+            return
+        query = self.binder_filter_var.get().strip().casefold()
+        self.binder_records = [record for record in all_records if query in record["unit"].casefold()]
+        y = 12
+        for index, binder in enumerate(self.binder_records):
+            fill = "#123D6A" if binder["available"] else "#263241"
+            outline = DARK_THEME["accent"] if binder["available"] else DARK_THEME["muted"]
+            tag = f"binder-{index}"
+            self.binder_shelf.create_rectangle(12, y, 210, y + 46, fill=fill, outline=outline, width=2, tags=("binder", tag))
+            self.binder_shelf.create_line(20, y + 7, 202, y + 7, fill=outline, width=2, tags=("binder", tag))
+            self.binder_shelf.create_line(20, y + 39, 202, y + 39, fill=outline, width=2, tags=("binder", tag))
+            suffix = "" if binder["available"] else "  •  folder missing"
+            self.binder_shelf.create_text(
+                28, y + 23, anchor="w", text=f"UNIT {binder['unit']}{suffix}",
+                fill=DARK_THEME["text"], font=("Segoe UI", 10, "bold"), tags=("binder", tag),
+            )
+            y += 56
+        self.binder_shelf.configure(scrollregion=(0, 0, 225, max(y, 1)))
+        available = sum(1 for record in all_records if record["available"])
+        visible = f"{len(self.binder_records)} shown • " if query else ""
+        self.binder_page_status_var.set(
+            f"{visible}{available} binder folder(s) available • {len(all_records)} database asset record(s)."
+        )
+
+    def _select_binder_from_shelf(self, _event=None) -> None:
+        tags = self.binder_shelf.gettags("current")
+        index_tag = next((tag for tag in tags if tag.startswith("binder-")), None)
+        if index_tag is None:
+            return
+        binder = self.binder_records[int(index_tag.split("-", 1)[1])]
+        self.active_binder = binder
+        self.binder_title_var.set(f"Unit {binder['unit']}  •  {binder['owner'] or 'Unassigned ownership'}")
+        if not binder["available"]:
+            self._set_binder_page_message("The canonical unit binder folder has not been created yet.")
+            self.binder_page_status_var.set(str(binder["folder"]))
+            self.binder_document_box.configure(values=())
+            self.binder_document_var.set("")
+            return
+        self._open_binder_section(BINDER_SECTIONS[0][1])
+
+    def _set_binder_page_message(self, message: str) -> None:
+        self.binder_page_image = None
+        self.binder_page_canvas.delete("all")
+        width = max(300, self.binder_page_canvas.winfo_width())
+        height = max(300, self.binder_page_canvas.winfo_height())
+        self.binder_page_canvas.create_text(
+            width // 2,
+            height // 2,
+            text=message,
+            fill=DARK_THEME["muted"],
+            font=("Segoe UI", 11),
+            justify="center",
+            width=max(260, width - 60),
+        )
+        self.binder_page_canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _open_binder_section(
+        self,
+        section_folder: str,
+        *,
+        document_index: int = 0,
+        last_page: bool = False,
+    ) -> None:
+        if self.active_binder is None or not self.active_binder["available"]:
+            return
+        self.active_binder_section = section_folder
+        try:
+            documents = list_binder_documents(self.active_binder["folder"], section_folder)
+        except Exception as error:
+            self.binder_page_status_var.set(f"Binder tab unavailable: {error}")
+            return
+        self.binder_document_paths = {path.name: path for path in documents}
+        self.binder_document_box.configure(values=tuple(self.binder_document_paths))
+        self.binder_document_var.set(documents[0].name if documents else "")
+        label = next(label for label, folder in BINDER_SECTIONS if folder == section_folder)
+        if not documents:
+            self.active_binder_pdf = None
+            self.binder_page_index = 0
+            self.binder_page_count = 0
+            self.binder_page_image = None
+            self._set_binder_page_message(f"No PDF documents in the {label} tab.\n\nUse Next Page to continue to the next category.")
+            self.binder_page_status_var.set(f"Unit {self.active_binder['unit']} • {label} • 0 documents")
+            return
+        document_index = min(max(document_index, 0), len(documents) - 1)
+        self.binder_document_var.set(documents[document_index].name)
+        self._select_binder_document(last_page=last_page)
+
+    def _select_binder_document(self, *, last_page: bool = False) -> None:
+        self.active_binder_pdf = self.binder_document_paths.get(self.binder_document_var.get())
+        self.binder_page_index = 0
+        self._render_active_binder_page()
+        if last_page and self.binder_page_count > 1:
+            self.binder_page_index = self.binder_page_count - 1
+            self._render_active_binder_page()
+
+    def _turn_binder_page(self, direction: int) -> None:
+        if self.active_binder is None or self.active_binder_section is None:
+            return
+        section_index = next(
+            index for index, (_label, folder) in enumerate(BINDER_SECTIONS) if folder == self.active_binder_section
+        )
+        page_counts = []
+        documents_by_section = []
+        for _label, folder in BINDER_SECTIONS:
+            documents = list_binder_documents(self.active_binder["folder"], folder)
+            documents_by_section.append(documents)
+            page_counts.append(
+                tuple(
+                    self.binder_page_count if path == self.active_binder_pdf and self.binder_page_count else 1
+                    for path in documents
+                )
+            )
+        current_documents = documents_by_section[section_index]
+        document_index = (
+            current_documents.index(self.active_binder_pdf)
+            if self.active_binder_pdf in current_documents
+            else None
+        )
+        page_index = self.binder_page_index if document_index is not None else None
+        target_section, target_document, target_page = advance_binder_position(
+            page_counts,
+            section_index,
+            document_index,
+            page_index,
+            direction,
+        )
+        if (target_section, target_document, target_page) == (section_index, document_index, page_index):
+            return
+        if target_section != section_index:
+            self._open_binder_section(
+                BINDER_SECTIONS[target_section][1],
+                document_index=target_document or 0,
+                last_page=direction < 0 and target_document is not None,
+            )
+            return
+        if target_document != document_index and target_document is not None:
+            self.binder_document_var.set(current_documents[target_document].name)
+            self._select_binder_document(last_page=direction < 0)
+            return
+        if target_page is not None:
+            self.binder_page_index = target_page
+            self._render_active_binder_page()
+
+    def _change_binder_zoom(self, delta: float) -> None:
+        self.binder_zoom_factor = min(4.0, max(0.25, self.binder_zoom_factor + delta))
+        self.binder_zoom_var.set(f"{round(self.binder_zoom_factor * 100):d}%")
+        self._render_active_binder_page()
+
+    def _fit_binder_page(self) -> None:
+        self.binder_zoom_factor = 1.0
+        self.binder_zoom_var.set("100%")
+        self._render_active_binder_page()
+
+    def _render_active_binder_page(self) -> None:
+        if self.active_binder_pdf is None or self.active_binder_section is None or self.active_binder is None:
+            return
+        expected_folder = self.active_binder["folder"] / self.active_binder_section
+        width = max(300, self.binder_page_canvas.winfo_width() - 20)
+        height = max(300, self.binder_page_canvas.winfo_height() - 20)
+        try:
+            rendered = render_binder_page(
+                self.active_binder_pdf,
+                expected_folder,
+                self.binder_page_index,
+                max_width=width,
+                max_height=height,
+                zoom_factor=self.binder_zoom_factor,
+            )
+            encoded = base64.b64encode(rendered["png"])
+            self.binder_page_image = tk.PhotoImage(data=encoded)
+        except Exception as error:
+            self.binder_page_image = None
+            self._set_binder_page_message(f"This PDF page could not be rendered.\n\n{error}")
+            self.binder_page_status_var.set("Page rendering failed")
+            return
+        self.binder_page_count = rendered["page_count"]
+        self.binder_page_canvas.delete("all")
+        canvas_width = max(1, self.binder_page_canvas.winfo_width())
+        canvas_height = max(1, self.binder_page_canvas.winfo_height())
+        x = max(10, (canvas_width - rendered["width"]) // 2)
+        y = max(10, (canvas_height - rendered["height"]) // 2)
+        self.binder_page_canvas.create_image(x, y, image=self.binder_page_image, anchor="nw")
+        self.binder_page_canvas.configure(
+            scrollregion=(
+                0,
+                0,
+                max(canvas_width, x + rendered["width"] + 10),
+                max(canvas_height, y + rendered["height"] + 10),
+            )
+        )
+        self.binder_page_canvas.xview_moveto(0)
+        self.binder_page_canvas.yview_moveto(0)
+        label = next(label for label, folder in BINDER_SECTIONS if folder == self.active_binder_section)
+        self.binder_page_status_var.set(
+            f"{label} • {self.active_binder_pdf.name} • Page {self.binder_page_index + 1} of {self.binder_page_count}"
         )
 
     def _bind_approval_on_enter(self, *widgets) -> None:
@@ -547,8 +1199,147 @@ class DotReviewApp:
         self.approve_selected()
         return "break"
 
+    def import_documents(self) -> None:
+        if self.scanning or self.ocr_running:
+            self.status_var.set("Wait for the current scan or OCR operation to finish before importing more PDFs.")
+            return
+        selected = filedialog.askopenfilenames(
+            title="Import PDFs into DocMarshal",
+            filetypes=(("PDF documents", "*.pdf"),),
+            parent=self.root,
+        )
+        if not selected:
+            return
+        self.import_button.configure(state="disabled")
+        self.status_var.set(f"Importing {len(selected)} PDF document(s)...")
+        threading.Thread(target=self._import_worker, args=(tuple(selected),), daemon=True).start()
+
+    def _import_worker(self, selected: tuple[str, ...]) -> None:
+        try:
+            results = import_pdf_documents(selected, self.incoming)
+        except Exception as error:
+            self.events.put(("import_error", str(error)))
+            return
+        self.events.put(("import_done", results))
+
+    def run_ocr_on_selected(self) -> None:
+        if self.scanning or self.ocr_running:
+            self.status_var.set("Wait for the current scan or OCR operation to finish before running OCR.")
+            return
+        result = self._selected_result()
+        if not result:
+            messagebox.showinfo("Select a document", "Select an Incoming PDF to run OCR.")
+            return
+        source = Path(result.get("source_file", ""))
+        self.ocr_running = True
+        self.ocr_button.configure(state="disabled")
+        self.bulk_ocr_button.configure(state="disabled")
+        self.status_var.set(f"Running OCR on {source.name}. This may take several minutes...")
+        threading.Thread(target=self._ocr_worker, args=(source,), daemon=True).start()
+
+    def _ocr_worker(self, source: Path) -> None:
+        try:
+            result = run_pdf_ocr(
+                source,
+                incoming_root=self.incoming,
+                backup_root=self.processed / "OCR Originals",
+            )
+        except Exception as error:
+            self.events.put(("ocr_error", source.name, str(error)))
+            return
+        if result["status"] == "ocr_completed":
+            self._record_ocr_audit(result)
+        self.events.put(("ocr_done", result))
+
+    def _record_ocr_audit(self, result: dict) -> None:
+        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "event": "ocr_completed",
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "source_file": result["source"],
+                        "backup_file": result["backup_path"],
+                        "page_count": result["page_count"],
+                        "sha256_before": result["sha256_before"],
+                        "sha256_after": result["sha256_after"],
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+    def run_ocr_on_all(self) -> None:
+        if self.scanning or self.ocr_running:
+            self.status_var.set("Wait for the current scan or OCR operation to finish.")
+            return
+        candidates = ocr_candidate_paths(self.model.results, self.incoming)
+        if not candidates:
+            self.status_var.set("No Incoming PDFs are currently flagged as needing OCR.")
+            return
+        if not messagebox.askyesno(
+            "Run bulk OCR",
+            f"Run OCR on {len(candidates)} image-only PDF(s)?\n\n"
+            "This can take a long time. Originals will be preserved under Processed\\OCR Originals.",
+            parent=self.root,
+        ):
+            return
+        self.ocr_running = True
+        self.ocr_button.configure(state="disabled")
+        self.bulk_ocr_button.configure(state="disabled")
+        self.import_button.configure(state="disabled")
+        self.scan_button.configure(state="disabled")
+        self.progress.configure(maximum=len(candidates), value=0)
+        self.progress_text.configure(text=f"0 of {len(candidates)}")
+        self.status_var.set(f"Starting bulk OCR for {len(candidates)} PDF(s)...")
+        threading.Thread(target=self._bulk_ocr_worker, args=(candidates,), daemon=True).start()
+
+    def _bulk_ocr_worker(self, candidates: list[Path]) -> None:
+        try:
+            tesseract = find_tesseract()
+        except Exception as error:
+            self.events.put(("bulk_ocr_error", str(error)))
+            return
+        completed = 0
+        already_searchable = 0
+        errors = []
+        total = len(candidates)
+        for index, source in enumerate(candidates, start=1):
+            try:
+                result = run_pdf_ocr(
+                    source,
+                    incoming_root=self.incoming,
+                    backup_root=self.processed / "OCR Originals",
+                    tesseract_executable=tesseract,
+                )
+                if result["status"] == "ocr_completed":
+                    completed += 1
+                    self._record_ocr_audit(result)
+                else:
+                    already_searchable += 1
+                detail = result["status"]
+            except Exception as error:
+                errors.append({"filename": source.name, "error": str(error)})
+                detail = "failed"
+            self.events.put(("bulk_ocr_progress", index, total, source.name, detail))
+        summary = {
+            "completed": completed,
+            "already_searchable": already_searchable,
+            "errors": errors,
+            "total": total,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.review_folder.mkdir(parents=True, exist_ok=True)
+        report_path = self.review_folder / f"bulk_ocr_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.json"
+        temporary_report = report_path.with_suffix(".tmp")
+        temporary_report.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        os.replace(temporary_report, report_path)
+        summary["report_path"] = str(report_path)
+        self.events.put(("bulk_ocr_done", summary))
+
     def scan_incoming(self) -> None:
-        if self.scanning:
+        if self.scanning or self.ocr_running:
             return
         if self.session_load_error:
             self._show_session_error()
@@ -633,6 +1424,81 @@ class DotReviewApp:
                     self._refresh()
                 elif event[0] == "scan_done":
                     self._finish_scan()
+                elif event[0] == "import_done":
+                    _, results = event
+                    self.import_button.configure(state="normal")
+                    copied = sum(item["status"] == "copied_verified" for item in results)
+                    identical = sum(item["status"] == "already_identical" for item in results)
+                    conflicts = sum(item["status"] == "destination_conflict" for item in results)
+                    if conflicts:
+                        messagebox.showwarning(
+                            "Some PDFs were not imported",
+                            f"{conflicts} file(s) had the same filename as a different Incoming PDF and were not overwritten.",
+                        )
+                    if copied or identical:
+                        self.status_var.set(
+                            f"Imported {copied} PDF(s); {identical} already present. Scanning Incoming..."
+                        )
+                        self.scan_incoming()
+                    else:
+                        self.status_var.set("No PDFs were imported.")
+                elif event[0] == "import_error":
+                    self.import_button.configure(state="normal")
+                    self.status_var.set(f"Import failed: {event[1]}")
+                    messagebox.showerror("PDF import failed", event[1])
+                elif event[0] == "ocr_done":
+                    _, result = event
+                    self.ocr_running = False
+                    self.ocr_button.configure(state="normal")
+                    self.bulk_ocr_button.configure(state="normal")
+                    if result["status"] == "already_searchable":
+                        self.status_var.set(f"{Path(result['source']).name} already contains searchable text.")
+                    else:
+                        self.status_var.set(f"OCR completed for {Path(result['source']).name}. Reanalyzing Incoming...")
+                        self.scan_incoming()
+                elif event[0] == "ocr_error":
+                    _, filename, detail = event
+                    self.ocr_running = False
+                    self.ocr_button.configure(state="normal")
+                    self.bulk_ocr_button.configure(state="normal")
+                    self.status_var.set(f"OCR failed for {filename}: {detail}")
+                    messagebox.showerror("OCR failed", f"{filename}\n\n{detail}")
+                elif event[0] == "bulk_ocr_progress":
+                    _, index, total, filename, detail = event
+                    self.progress.configure(value=index)
+                    self.progress_text.configure(text=f"{index} of {total}")
+                    self.status_var.set(f"Bulk OCR {index} of {total}: {filename} • {detail}")
+                elif event[0] == "bulk_ocr_done":
+                    _, summary = event
+                    self.ocr_running = False
+                    self.ocr_button.configure(state="normal")
+                    self.bulk_ocr_button.configure(state="normal")
+                    self.import_button.configure(state="normal")
+                    self.scan_button.configure(state="normal")
+                    failures = len(summary["errors"])
+                    self.status_var.set(
+                        f"Bulk OCR complete: {summary['completed']} converted, "
+                        f"{summary['already_searchable']} already searchable, {failures} failed."
+                    )
+                    if failures:
+                        examples = "\n".join(
+                            f"• {item['filename']}: {item['error']}" for item in summary["errors"][:3]
+                        )
+                        messagebox.showwarning(
+                            "Bulk OCR completed with failures",
+                            f"{failures} PDF(s) could not be converted. The remaining files continued normally.\n\n"
+                            f"{examples}\n\nFull report: {summary['report_path']}",
+                        )
+                    if summary["completed"] or summary["already_searchable"]:
+                        self.scan_incoming()
+                elif event[0] == "bulk_ocr_error":
+                    self.ocr_running = False
+                    self.ocr_button.configure(state="normal")
+                    self.bulk_ocr_button.configure(state="normal")
+                    self.import_button.configure(state="normal")
+                    self.scan_button.configure(state="normal")
+                    self.status_var.set(f"Bulk OCR could not start: {event[1]}")
+                    messagebox.showerror("Bulk OCR unavailable", event[1])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
@@ -1082,7 +1948,8 @@ class DotReviewApp:
 
 
 def launch(config_path: str | Path) -> None:
-    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    config_path = Path(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     root = tk.Tk()
-    DotReviewApp(root, config)
+    DotReviewApp(root, config, config_path=config_path)
     root.mainloop()

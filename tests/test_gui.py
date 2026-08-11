@@ -66,6 +66,32 @@ def test_docmarshal_branding_declares_product_name_and_icon():
     assert gui.APP_ICON_PATH.is_file()
 
 
+def test_main_window_declares_four_primary_navigation_tabs():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert "ttk.Notebook" in source
+    assert 'text="Sort"' in source
+    assert 'text="Database"' in source
+    assert 'text="Settings"' in source
+    assert 'text="Virtual Binder"' in source
+    assert "_build_database_tab" in source
+    assert "_build_settings_tab" in source
+    assert "_build_binder_tab" in source
+
+
+def test_sort_and_virtual_binder_expose_import_ocr_zoom_and_sequence_controls():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert 'text="Import PDFs"' in source
+    assert 'text="Run OCR on Selected"' in source
+    assert 'text="Run OCR on All Needing OCR"' in source
+    assert 'text="Zoom Out"' in source
+    assert 'text="Fit Page"' in source
+    assert 'text="Zoom In"' in source
+    assert "binder_page_canvas" in source
+    assert "advance_binder_position" in source
+
+
 def test_humanizes_internal_codes_for_user_facing_text():
     humanize = gui.DotReviewApp._humanize_user_text
 
