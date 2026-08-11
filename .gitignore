@@ -1,0 +1,30 @@
+# Local Python artifacts
+__pycache__/
+.pytest_cache/
+.venv/
+*.py[cod]
+
+# Local production configuration and operational data
+config.json
+data/*
+!data/.gitkeep
+*.db
+*.sqlite*
+*.jsonl
+
+# Local company operations and backups
+OPERATING_INSTRUCTIONS.md
+RELEASE_v1.0_PILOT.md
+Run DOT Pilot Backup.bat
+
+# Local tools, attachments, and generated visual evidence
+.hermes/
+quick-swap-tools/
+ui-modern-dark*.png
+docmarshal-ui.png
+
+# Editors and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

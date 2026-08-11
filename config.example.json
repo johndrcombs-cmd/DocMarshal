@@ -1,0 +1,13 @@
+{
+  "mode": "pilot",
+  "scan_incoming": "C:\\DocMarshal\\Incoming",
+  "scan_processed": "C:\\DocMarshal\\Processed",
+  "scan_approved": "C:\\DocMarshal\\Approved",
+  "scan_exceptions": "C:\\DocMarshal\\Exceptions",
+  "scan_review": "C:\\DocMarshal\\Review",
+  "fleet_workbook": "C:\\DocMarshal\\fleet-assets.xlsx",
+  "fleet_database": "data\\fleet.db",
+  "manual_assets_registry": "data\\manual_assets.json",
+  "unit_folders_root": "C:\\DocMarshal\\Fleet Documents",
+  "farm_asset_folders_root": "C:\\DocMarshal\\Farm Assets"
+}

@@ -1,0 +1,31 @@
+import ctypes
+from ctypes import wintypes
+from pathlib import Path
+from tkinter import messagebox
+
+from dotdocs.gui import launch
+
+ROOT = Path(__file__).resolve().parent
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+ctypes.set_last_error(0)
+mutex = kernel32.CreateMutexW(None, False, "Local\\DocMarshal")
+mutex_error = ctypes.get_last_error()
+if not mutex:
+    messagebox.showerror(
+        "DocMarshal",
+        f"The single-instance safety lock could not be created (Windows error {mutex_error}). The program will not start.",
+    )
+    raise SystemExit(1)
+
+try:
+    if mutex_error == 183:
+        messagebox.showinfo("DocMarshal", "DocMarshal is already running.")
+    else:
+        launch(ROOT / "config.json")
+finally:
+    kernel32.CloseHandle(mutex)
