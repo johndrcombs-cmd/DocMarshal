@@ -152,12 +152,18 @@ def run_pdf_ocr(
         tesseract = find_tesseract(tesseract_executable)
 
         def page_ocr(image_path: Path, output_pdf: Path) -> None:
+            startup_options = {}
+            if os.name == "nt":
+                startup_options["creationflags"] = getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0x08000000
+                )
             completed = subprocess.run(
                 (str(tesseract), str(image_path), str(output_pdf.with_suffix("")), "pdf"),
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=180,
+                **startup_options,
             )
             if completed.returncode != 0 or not output_pdf.is_file():
                 detail = completed.stderr.strip() or completed.stdout.strip() or "Tesseract did not create an output PDF."

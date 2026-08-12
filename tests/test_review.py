@@ -125,6 +125,7 @@ def test_additional_page_gets_distinct_filename_and_can_be_approved(tmp_path):
         audit_path=tmp_path / "Review" / "audit.jsonl",
         unit_folders_root=unit_root,
         incoming_folder=Path(corrected["source_file"]).parent,
+        approved_folder=tmp_path / "Approved",
     )
 
     assert approved["status"] == "approved"
@@ -299,7 +300,7 @@ def test_apply_correction_rejects_invalid_values(
         )
 
 
-def test_approve_document_copies_preserves_source_and_writes_audit(tmp_path):
+def test_approve_document_copies_and_archives_source_and_writes_audit(tmp_path):
     corrected = apply_correction(
         _result(tmp_path),
         unit="91",
@@ -309,18 +310,425 @@ def test_approve_document_copies_preserves_source_and_writes_audit(tmp_path):
     )
     audit_path = tmp_path / "Review" / "audit.jsonl"
 
-    approved = approve_document(corrected, audit_path=audit_path, unit_folders_root=_unit_root(tmp_path), incoming_folder=Path(corrected["source_file"]).parent)
+    approved_folder = tmp_path / "Approved"
+    approved = approve_document(
+        corrected,
+        audit_path=audit_path,
+        unit_folders_root=_unit_root(tmp_path),
+        incoming_folder=Path(corrected["source_file"]).parent,
+        approved_folder=approved_folder,
+    )
 
     source = Path(corrected["source_file"])
     destination = Path(corrected["proposed_destination"])
-    assert source.exists()
-    assert destination.read_bytes() == source.read_bytes()
+    archive = approved_folder / source.name
+    assert not source.exists()
+    assert destination.read_bytes() == archive.read_bytes()
     assert approved["status"] == "approved"
     assert approved["approved_destination"] == str(destination)
+    assert approved["approved_archived_file"] == str(archive)
     entries = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert entries[-1]["event"] == "approved"
     assert entries[-1]["source_file"] == str(source)
     assert entries[-1]["destination"] == str(destination)
+    assert entries[-1]["archived_file"] == str(archive)
+
+
+def test_approve_document_rejects_approved_folder_equal_to_incoming_before_side_effects(tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    source = Path(corrected["source_file"])
+    destination = Path(corrected["proposed_destination"])
+    audit_path = tmp_path / "Review" / "audit.jsonl"
+
+    with pytest.raises(ApprovalError, match="must be different"):
+        approve_document(
+            corrected,
+            audit_path=audit_path,
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=source.parent,
+            approved_folder=source.parent,
+        )
+
+    assert source.is_file()
+    assert not destination.exists()
+    assert not audit_path.exists()
+
+
+def test_approve_document_uses_collision_safe_archive_name(tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    approved_folder = tmp_path / "Approved"
+    approved_folder.mkdir()
+    existing = approved_folder / "scan.pdf"
+    existing.write_bytes(b"existing-approved-source")
+
+    approved = approve_document(
+        corrected,
+        audit_path=tmp_path / "Review" / "audit.jsonl",
+        unit_folders_root=_unit_root(tmp_path),
+        incoming_folder=Path(corrected["source_file"]).parent,
+        approved_folder=approved_folder,
+    )
+
+    assert Path(approved["approved_archived_file"]).name == "scan_2.pdf"
+    assert existing.read_bytes() == b"existing-approved-source"
+
+
+def test_approve_document_never_removes_archive_created_by_a_collision_race(monkeypatch, tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    approved_folder = tmp_path / "Approved"
+    source = Path(corrected["source_file"])
+    original_rename = Path.rename
+    injected = False
+
+    def race_rename(path, target):
+        nonlocal injected
+        if path == source and Path(target) == approved_folder / "scan.pdf" and not injected:
+            injected = True
+            approved_folder.mkdir(parents=True, exist_ok=True)
+            with (approved_folder / "scan.pdf").open("xb") as other_archive:
+                other_archive.write(b"other-process-archive")
+            raise FileExistsError(target)
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", race_rename)
+
+    with pytest.raises(ApprovalError):
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=Path(corrected["source_file"]).parent,
+            approved_folder=approved_folder,
+        )
+
+    assert (approved_folder / "scan.pdf").read_bytes() == b"other-process-archive"
+    assert Path(corrected["source_file"]).is_file()
+    assert not Path(corrected["proposed_destination"]).exists()
+
+
+def test_approve_document_preserves_source_replaced_at_archive_boundary(monkeypatch, tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    source = Path(corrected["source_file"])
+    approved_folder = tmp_path / "Approved"
+    original_rename = Path.rename
+    injected = False
+
+    def replace_source_then_rename(path, target):
+        nonlocal injected
+        if path == source and Path(target).parent == approved_folder and not injected:
+            injected = True
+            source.unlink()
+            source.write_bytes(b"other-process-incoming-file")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", replace_source_then_rename)
+
+    with pytest.raises(ApprovalError, match="source was restored"):
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=source.parent,
+            approved_folder=approved_folder,
+        )
+
+    assert source.read_bytes() == b"other-process-incoming-file"
+    assert not Path(corrected["proposed_destination"]).exists()
+    assert not list(approved_folder.glob("*.pdf"))
+
+
+def test_approve_document_does_not_delete_replaced_production_file_during_rollback(monkeypatch, tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    destination = Path(corrected["proposed_destination"])
+    original_append = review_module._append_audit
+
+    def replace_destination_then_fail(path, entry):
+        if entry.get("event") == "approved":
+            destination.unlink()
+            destination.write_bytes(b"other-process-production-file")
+            raise OSError("forced final audit failure")
+        return original_append(path, entry)
+
+    monkeypatch.setattr(review_module, "_append_audit", replace_destination_then_fail)
+
+    with pytest.raises(ApprovalError, match="rollback could not safely restore every file"):
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=Path(corrected["source_file"]).parent,
+            approved_folder=tmp_path / "Approved",
+        )
+
+    assert Path(corrected["source_file"]).is_file()
+    assert destination.read_bytes() == b"other-process-production-file"
+
+
+def test_production_quarantine_verifies_the_atomically_moved_file(monkeypatch, tmp_path):
+    path = tmp_path / "production.pdf"
+    owned = b"owned-production"
+    path.write_bytes(owned)
+    identity = path.stat()
+    expected_hash = hashlib.sha256(owned).hexdigest()
+    original_delete = review_module._delete_owned_quarantine_windows
+    injected = False
+
+    def replace_shared_path_before_handle_bound_verification(candidate, *args):
+        nonlocal injected
+        if ".docmarshal-rollback-" in candidate.name and not injected:
+            injected = True
+            path.write_bytes(b"other-process-production")
+        return original_delete(candidate, *args)
+
+    monkeypatch.setattr(
+        review_module,
+        "_delete_owned_quarantine_windows",
+        replace_shared_path_before_handle_bound_verification,
+    )
+
+    review_module._remove_owned_file_via_quarantine(path, identity, expected_hash, len(owned))
+
+    assert path.read_bytes() == b"other-process-production"
+    assert not list(tmp_path.glob("*.docmarshal-rollback-*.tmp"))
+
+
+def test_windows_quarantine_cleanup_uses_handle_bound_delete(monkeypatch, tmp_path):
+    path = tmp_path / "production.pdf"
+    owned = b"owned-production"
+    path.write_bytes(owned)
+    identity = path.stat()
+    expected_hash = hashlib.sha256(owned).hexdigest()
+    calls = []
+
+    monkeypatch.setattr(review_module.os, "name", "nt")
+    monkeypatch.setattr(
+        review_module,
+        "_delete_owned_quarantine_windows",
+        lambda quarantine, expected_identity, digest, size: (
+            calls.append((quarantine, expected_identity, digest, size)) or True
+        ),
+    )
+
+    review_module._remove_owned_file_via_quarantine(path, identity, expected_hash, len(owned))
+
+    assert len(calls) == 1
+    assert ".docmarshal-rollback-" in calls[0][0].name
+
+
+def test_windows_file_disposition_info_uses_documented_one_byte_boolean():
+    assert review_module.ctypes.sizeof(review_module._FILE_DISPOSITION_INFO) == 1
+
+
+def test_windows_handle_is_closed_when_crt_descriptor_conversion_fails(monkeypatch, tmp_path):
+    path = tmp_path / "owned.tmp"
+    data = b"owned-production"
+    path.write_bytes(data)
+    identity = path.stat()
+    monkeypatch.setattr(
+        review_module,
+        "_win32_open_osfhandle",
+        lambda _handle: (_ for _ in ()).throw(OSError("forced conversion failure")),
+    )
+
+    with pytest.raises(OSError, match="forced conversion failure"):
+        review_module._delete_owned_quarantine_windows(
+            path, identity, hashlib.sha256(data).hexdigest(), len(data)
+        )
+
+    path.unlink()
+    assert not path.exists()
+
+
+def test_windows_descriptor_is_closed_when_fdopen_fails(monkeypatch, tmp_path):
+    path = tmp_path / "owned.tmp"
+    data = b"owned-production"
+    path.write_bytes(data)
+    identity = path.stat()
+    monkeypatch.setattr(
+        review_module,
+        "_fdopen_binary_read",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("forced fdopen failure")),
+    )
+
+    with pytest.raises(OSError, match="forced fdopen failure"):
+        review_module._delete_owned_quarantine_windows(
+            path, identity, hashlib.sha256(data).hexdigest(), len(data)
+        )
+
+    path.unlink()
+    assert not path.exists()
+
+
+def test_approve_document_does_not_delete_replaced_archive_during_rollback(monkeypatch, tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    approved_folder = tmp_path / "Approved"
+    archive = approved_folder / "scan.pdf"
+    original_append = review_module._append_audit
+
+    def replace_archive_then_fail(path, entry):
+        if entry.get("event") == "approved":
+            archive.unlink()
+            archive.write_bytes(b"other-process-approved-file")
+            raise OSError("forced final audit failure")
+        return original_append(path, entry)
+
+    monkeypatch.setattr(review_module, "_append_audit", replace_archive_then_fail)
+
+    with pytest.raises(ApprovalError, match="rollback could not safely restore every file"):
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=Path(corrected["source_file"]).parent,
+            approved_folder=approved_folder,
+        )
+
+    assert archive.read_bytes() == b"other-process-approved-file"
+    assert not Path(corrected["proposed_destination"]).exists()
+
+
+def test_archive_quarantine_verifies_moved_file_without_touching_new_shared_path(monkeypatch, tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    source = Path(corrected["source_file"])
+    approved_folder = tmp_path / "Approved"
+    archive = approved_folder / source.name
+    original_append = review_module._append_audit
+    original_matches = review_module._matches_owned_file
+    injected = False
+
+    def fail_final_audit(path, entry):
+        if entry.get("event") == "approved":
+            raise OSError("forced final audit failure")
+        return original_append(path, entry)
+
+    def create_new_archive_during_quarantine_verification(candidate, *args):
+        nonlocal injected
+        if ".docmarshal-restore-" in candidate.name and not injected:
+            injected = True
+            archive.write_bytes(b"other-process-approved-file")
+        return original_matches(candidate, *args)
+
+    monkeypatch.setattr(review_module, "_append_audit", fail_final_audit)
+    monkeypatch.setattr(
+        review_module, "_matches_owned_file", create_new_archive_during_quarantine_verification
+    )
+
+    with pytest.raises(ApprovalError, match="source was restored"):
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=source.parent,
+            approved_folder=approved_folder,
+        )
+
+    assert source.read_bytes() == b"%PDF-verified-source"
+    assert archive.read_bytes() == b"other-process-approved-file"
+    assert not Path(corrected["proposed_destination"]).exists()
+
+
+def test_approve_document_reports_persistent_audit_failure_as_approval_error(monkeypatch, tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+
+    monkeypatch.setattr(
+        review_module,
+        "_append_audit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("audit unavailable")),
+    )
+
+    with pytest.raises(ApprovalError, match="Failure logging also failed"):
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=Path(corrected["source_file"]).parent,
+            approved_folder=tmp_path / "Approved",
+        )
+
+    assert Path(corrected["source_file"]).is_file()
+    assert not Path(corrected["proposed_destination"]).exists()
+
+
+def test_approve_document_restores_source_and_removes_copy_when_final_audit_fails(monkeypatch, tmp_path):
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="RP",
+        controlling_date="2026-07-07",
+        unit_folders_root=_unit_root(tmp_path),
+    )
+    original_append = review_module._append_audit
+
+    def fail_approved_audit(path, entry):
+        if entry.get("event") == "approved":
+            raise OSError("forced final audit failure")
+        return original_append(path, entry)
+
+    monkeypatch.setattr(review_module, "_append_audit", fail_approved_audit)
+    source = Path(corrected["source_file"])
+    destination = Path(corrected["proposed_destination"])
+    approved_folder = tmp_path / "Approved"
+
+    with pytest.raises(ApprovalError, match="source was restored"):
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=source.parent,
+            approved_folder=approved_folder,
+        )
+
+    assert source.read_bytes() == b"%PDF-verified-source"
+    assert not destination.exists()
+    assert not list(approved_folder.glob("*.pdf"))
 
 
 def test_approve_document_never_overwrites_existing_destination(tmp_path):
@@ -336,7 +744,13 @@ def test_approve_document_never_overwrites_existing_destination(tmp_path):
     audit_path = tmp_path / "Review" / "audit.jsonl"
 
     with pytest.raises(ApprovalError, match="already exists"):
-        approve_document(corrected, audit_path=audit_path, unit_folders_root=_unit_root(tmp_path), incoming_folder=Path(corrected["source_file"]).parent)
+        approve_document(
+            corrected,
+            audit_path=audit_path,
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=Path(corrected["source_file"]).parent,
+            approved_folder=tmp_path / "Approved",
+        )
 
     assert destination.read_bytes() == b"existing-production-file"
     assert Path(corrected["source_file"]).exists()
@@ -550,7 +964,13 @@ def test_mark_duplicate_restores_incoming_pdf_if_final_audit_fails(monkeypatch, 
 def test_approve_document_rejects_unreviewed_exception(tmp_path):
     result = _result(tmp_path)
     with pytest.raises(ApprovalError, match="ready"):
-        approve_document(result, audit_path=tmp_path / "audit.jsonl", unit_folders_root=_unit_root(tmp_path), incoming_folder=Path(result["source_file"]).parent)
+        approve_document(
+            result,
+            audit_path=tmp_path / "audit.jsonl",
+            unit_folders_root=_unit_root(tmp_path),
+            incoming_folder=Path(result["source_file"]).parent,
+            approved_folder=tmp_path / "Approved",
+        )
 
 
 def test_approve_document_rejects_tampered_destination_outside_unit_root(tmp_path):
@@ -572,6 +992,7 @@ def test_approve_document_rejects_tampered_destination_outside_unit_root(tmp_pat
             audit_path=tmp_path / "Review" / "audit.jsonl",
             unit_folders_root=unit_root,
             incoming_folder=Path(corrected["source_file"]).parent,
+            approved_folder=tmp_path / "Approved",
         )
 
     assert not outside.exists()
@@ -583,7 +1004,13 @@ def test_approve_rejects_source_changed_after_review(tmp_path):
     corrected = apply_correction(result, unit="91", document_type="RP", controlling_date="2026-07-07", unit_folders_root=unit_root)
     Path(corrected["source_file"]).write_bytes(b"replacement-content")
     with pytest.raises(ApprovalError, match="changed since review"):
-        approve_document(corrected, audit_path=tmp_path / "audit.jsonl", unit_folders_root=unit_root, incoming_folder=Path(corrected["source_file"]).parent)
+        approve_document(
+            corrected,
+            audit_path=tmp_path / "audit.jsonl",
+            unit_folders_root=unit_root,
+            incoming_folder=Path(corrected["source_file"]).parent,
+            approved_folder=tmp_path / "Approved",
+        )
 
 
 def test_review_session_round_trip(tmp_path):

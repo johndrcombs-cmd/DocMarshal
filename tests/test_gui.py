@@ -207,6 +207,74 @@ def test_main_window_declares_four_primary_navigation_tabs():
     assert "_build_binder_tab" in source
 
 
+def test_approved_record_retention_requires_a_real_archive_or_legacy_source(tmp_path):
+    archived = tmp_path / "Approved" / "scan.pdf"
+    archived.parent.mkdir()
+    archived.write_bytes(b"pdf")
+    legacy = tmp_path / "Incoming" / "legacy.pdf"
+    legacy.parent.mkdir()
+    legacy.write_bytes(b"pdf")
+
+    assert gui.approved_record_file_exists({"approved_archived_file": str(archived)})
+    assert gui.approved_record_file_exists({"source_file": str(legacy)})
+    assert not gui.approved_record_file_exists({"source_file": str(tmp_path / "missing.pdf")})
+    assert not gui.approved_record_file_exists({})
+
+
+def test_new_approved_record_never_falls_back_when_declared_archive_is_missing(tmp_path):
+    replacement = tmp_path / "Incoming" / "scan.pdf"
+    replacement.parent.mkdir()
+    replacement.write_bytes(b"different-pdf")
+    record = {
+        "approved_archived_file": str(tmp_path / "Approved" / "missing.pdf"),
+        "source_file": str(replacement),
+    }
+
+    assert gui.approved_record_path(record) is None
+    assert not gui.approved_record_file_exists(record)
+
+
+def test_open_pdf_uses_archived_or_legacy_approved_path_without_unsafe_fallback(monkeypatch, tmp_path):
+    incoming = tmp_path / "Incoming"
+    approved = tmp_path / "Approved"
+    incoming.mkdir()
+    approved.mkdir()
+    archived = approved / "archived.pdf"
+    archived.write_bytes(b"pdf")
+    legacy = incoming / "legacy.pdf"
+    legacy.write_bytes(b"pdf")
+    replacement = incoming / "missing.pdf"
+    replacement.write_bytes(b"different-pdf")
+
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.incoming = incoming
+    app.approved = approved
+    app.processed = tmp_path / "Processed"
+    app.exceptions = tmp_path / "Exceptions"
+    opened = []
+    errors = []
+    monkeypatch.setattr(gui.os, "startfile", lambda path: opened.append(Path(path)))
+    monkeypatch.setattr(gui.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+
+    app._selected_result = lambda: {
+        "status": "approved",
+        "source_file": str(incoming / "archived.pdf"),
+        "approved_archived_file": str(archived),
+    }
+    app.open_pdf()
+    app._selected_result = lambda: {"status": "approved", "source_file": str(legacy)}
+    app.open_pdf()
+    app._selected_result = lambda: {
+        "status": "approved",
+        "source_file": str(replacement),
+        "approved_archived_file": str(approved / "missing.pdf"),
+    }
+    app.open_pdf()
+
+    assert opened == [archived, legacy]
+    assert errors == [("File unavailable", "The approved PDF archive cannot be found.")]
+
+
 def test_sort_and_virtual_binder_expose_import_ocr_zoom_and_sequence_controls():
     source = _gui_sources()
 
@@ -472,7 +540,7 @@ def test_approval_applies_current_fields_and_files_in_one_click_without_popups(
     monkeypatch.setattr(
         gui,
         "approve_document",
-        lambda candidate, **kwargs: approval_inputs.append(candidate) or approved,
+        lambda candidate, **kwargs: approval_inputs.append((candidate, kwargs)) or approved,
     )
     monkeypatch.setattr(gui, "save_review_session", lambda *args, **kwargs: None)
 
@@ -487,6 +555,7 @@ def test_approval_applies_current_fields_and_files_in_one_click_without_popups(
     app.farm_unit_root = tmp_path / "Farm Assets"
     app.database = tmp_path / "fleet.db"
     app.incoming = source.parent
+    app.approved = tmp_path / "Approved"
     app.session_path = tmp_path / "active_review.json"
     app.model = _Model()
     app.model.results = [result]
@@ -502,7 +571,8 @@ def test_approval_applies_current_fields_and_files_in_one_click_without_popups(
     assert confirmations == []
     assert success_popups == []
     assert correction_calls[0][1]["page_suffix"] == "pg2"
-    assert approval_inputs == [corrected]
+    assert approval_inputs[0][0] == corrected
+    assert approval_inputs[0][1]["approved_folder"] == app.approved
     assert correction_audits
     assert app.model.replaced == approved
     assert app.status_var.value == "Approved and copied: 91_RP_07-07-2026_PG2.pdf"

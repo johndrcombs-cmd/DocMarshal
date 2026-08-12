@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import shutil
 import hashlib
+import ctypes
 import os
 import re
 import tempfile
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
+from ctypes import wintypes
 
 from .assets import AssetValidationError, asset_folder_root, ensure_standard_unit_folder
 from .database import find_asset_owner
@@ -31,6 +34,158 @@ class ReviewValidationError(ValueError):
 
 class ApprovalError(RuntimeError):
     pass
+
+
+class _FILE_DISPOSITION_INFO(ctypes.Structure):
+    _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+
+def _win32_open_osfhandle(handle: int) -> int:
+    import msvcrt
+
+    return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+
+
+def _fdopen_binary_read(descriptor: int):
+    return os.fdopen(descriptor, "rb", closefd=True)
+
+
+def _file_identity(path: Path) -> os.stat_result:
+    return path.stat()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _matches_owned_file(
+    path: Path,
+    identity: os.stat_result,
+    expected_hash: str,
+    expected_size: int,
+) -> bool:
+    try:
+        current = path.stat()
+        if not os.path.samestat(identity, current) or current.st_size != expected_size:
+            return False
+        return _file_sha256(path) == expected_hash
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _delete_owned_quarantine_windows(
+    path: Path,
+    identity: os.stat_result,
+    expected_hash: str,
+    expected_size: int,
+) -> bool:
+    import msvcrt
+
+    generic_read = 0x80000000
+    delete_access = 0x00010000
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    file_disposition_info = 4
+    invalid_handle_value = ctypes.c_void_p(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateFileW(
+        str(path),
+        generic_read | delete_access,
+        0,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise OSError(ctypes.get_last_error(), f"Could not exclusively open rollback quarantine: {path}")
+
+    try:
+        descriptor = _win32_open_osfhandle(handle)
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+    try:
+        quarantine_file = _fdopen_binary_read(descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+    with quarantine_file:
+        current = os.fstat(quarantine_file.fileno())
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: quarantine_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if (
+            not os.path.samestat(identity, current)
+            or current.st_size != expected_size
+            or digest.hexdigest() != expected_hash
+        ):
+            return False
+        disposition = _FILE_DISPOSITION_INFO(True)
+        if not kernel32.SetFileInformationByHandle(
+            msvcrt.get_osfhandle(quarantine_file.fileno()),
+            file_disposition_info,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise OSError(ctypes.get_last_error(), f"Could not mark rollback quarantine for deletion: {path}")
+    return True
+
+
+def _remove_owned_file_via_quarantine(
+    path: Path,
+    identity: os.stat_result,
+    expected_hash: str,
+    expected_size: int,
+) -> None:
+    quarantine = path.with_name(f".{path.name}.docmarshal-rollback-{uuid.uuid4().hex}.tmp")
+    try:
+        path.rename(quarantine)
+    except FileNotFoundError:
+        return
+    if os.name == "nt":
+        owned_removed = _delete_owned_quarantine_windows(
+            quarantine, identity, expected_hash, expected_size
+        )
+    elif _matches_owned_file(quarantine, identity, expected_hash, expected_size):
+        quarantine.unlink()
+        owned_removed = True
+    else:
+        owned_removed = False
+    if owned_removed:
+        return
+    if path.exists():
+        raise ApprovalError(
+            "A changed production file was quarantined during rollback, but its original path is now occupied; "
+            f"contact IT. Quarantine: {quarantine}"
+        )
+    quarantine.rename(path)
+    raise ApprovalError(f"Refusing to remove a production file that changed during approval: {path}")
 
 
 def _parse_review_date(value: str) -> date:
@@ -582,23 +737,34 @@ def approve_document(
     audit_path: str | Path,
     unit_folders_root: str | Path,
     incoming_folder: str | Path,
+    approved_folder: str | Path,
     farm_asset_folders_root: str | Path | None = None,
     database_path: str | Path | None = None,
 ) -> dict:
     source = Path(result.get("source_file") or "")
     destination_value = result.get("proposed_destination")
     destination = Path(destination_value) if destination_value else None
+    incoming_folder = Path(incoming_folder).resolve()
+    approved_folder = Path(approved_folder).resolve()
+    same_folder = os.path.normcase(str(incoming_folder)) == os.path.normcase(str(approved_folder))
+    if incoming_folder.exists() and approved_folder.exists():
+        same_folder = same_folder or os.path.samefile(incoming_folder, approved_folder)
+    if same_folder:
+        raise ApprovalError("The configured Incoming and Approved folders must be different.")
 
     def fail(message: str) -> None:
-        _append_audit(
-            audit_path,
-            {
-                "event": "approval_failed",
-                "source_file": str(source),
-                "destination": str(destination) if destination else None,
-                "reason": message,
-            },
-        )
+        try:
+            _append_audit(
+                audit_path,
+                {
+                    "event": "approval_failed",
+                    "source_file": str(source),
+                    "destination": str(destination) if destination else None,
+                    "reason": message,
+                },
+            )
+        except Exception as audit_error:
+            message = f"{message} Failure logging also failed: {audit_error}"
         raise ApprovalError(message)
 
     if result.get("status") != "ready_for_review":
@@ -607,7 +773,6 @@ def approve_document(
         fail(f"The source PDF does not exist: {source}")
     if source.suffix.lower() != ".pdf":
         fail("Only PDF source documents can be approved.")
-    incoming_folder = Path(incoming_folder).resolve()
     if source.resolve().parent != incoming_folder:
         fail("The source PDF is not directly inside the configured Incoming folder.")
     expected_hash = result.get("source_sha256")
@@ -658,17 +823,21 @@ def approve_document(
         )
     if not destination.parent.is_dir():
         fail(f"The destination folder does not exist: {destination.parent}")
-    _append_audit(
-        audit_path,
-        {
-            "event": "approval_started",
-            "source_file": str(source),
-            "destination": str(destination),
-            "source_sha256": expected_hash,
-        },
-    )
+    try:
+        _append_audit(
+            audit_path,
+            {
+                "event": "approval_started",
+                "source_file": str(source),
+                "destination": str(destination),
+                "source_sha256": expected_hash,
+            },
+        )
+    except Exception as error:
+        fail(f"Approval could not start because its audit record could not be written: {error}")
 
     temporary_path = None
+    destination_identity = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -686,6 +855,7 @@ def approve_document(
             raise ApprovalError("The temporary production copy failed content verification.")
         shutil.copystat(source, temporary_path)
         os.link(temporary_path, destination)
+        destination_identity = _file_identity(destination)
         temporary_path.unlink()
     except FileExistsError:
         fail(f"The destination file already exists: {destination}")
@@ -694,26 +864,101 @@ def approve_document(
             temporary_path.unlink(missing_ok=True)
         fail(f"The document could not be copied: {error}")
 
-    approved = dict(result)
-    approved.update(
-        {
-            "status": "approved",
-            "approved_destination": str(destination),
-            "approved_at_utc": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    _append_audit(
-        audit_path,
-        {
-            "event": "approved",
-            "source_file": str(source),
-            "destination": str(destination),
-            "unit": approved.get("unit"),
-            "asset_owner": approved.get("asset_owner"),
-            "document_type": approved.get("document_type"),
-            "controlling_date": approved.get("controlling_date"),
-            "page_suffix": approved.get("page_suffix"),
-            "manually_corrected": bool(approved.get("manually_corrected")),
-        },
-    )
+    archive = None
+    archive_identity = None
+    archive_hash = None
+    archive_size = None
+    source_removed = False
+    try:
+        approved_folder.mkdir(parents=True, exist_ok=True)
+        archive = approved_folder / source.name
+        sequence = 2
+        while archive.exists():
+            archive = approved_folder / f"{source.stem}_{sequence}{source.suffix}"
+            sequence += 1
+        source.rename(archive)
+        source_removed = True
+        archive_identity = _file_identity(archive)
+        archive_size = archive_identity.st_size
+        archive_hash = _file_sha256(archive)
+        if archive_size != expected_size or archive_hash != expected_hash:
+            raise ApprovalError("The approved source archive failed fingerprint verification.")
+
+        approved = dict(result)
+        approved.update(
+            {
+                "status": "approved",
+                "approved_destination": str(destination),
+                "approved_archived_file": str(archive) if archive is not None else None,
+                "approved_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        _append_audit(
+            audit_path,
+            {
+                "event": "approved",
+                "source_file": str(source),
+                "archived_file": str(archive) if archive is not None else None,
+                "destination": str(destination),
+                "unit": approved.get("unit"),
+                "asset_owner": approved.get("asset_owner"),
+                "document_type": approved.get("document_type"),
+                "controlling_date": approved.get("controlling_date"),
+                "page_suffix": approved.get("page_suffix"),
+                "manually_corrected": bool(approved.get("manually_corrected")),
+            },
+        )
+    except Exception as error:
+        rollback_errors = []
+        try:
+            if (
+                source_removed
+                and archive is not None
+                and archive_identity is not None
+                and archive_hash is not None
+                and archive_size is not None
+            ):
+                recovery_quarantine = archive.with_name(
+                    f".{archive.name}.docmarshal-restore-{uuid.uuid4().hex}.tmp"
+                )
+                archive.rename(recovery_quarantine)
+                if not _matches_owned_file(
+                    recovery_quarantine, archive_identity, archive_hash, archive_size
+                ):
+                    if archive.exists():
+                        raise ApprovalError(
+                            "A changed Approved file was quarantined during rollback, but its archive path is now "
+                            f"occupied; contact IT. Quarantine: {recovery_quarantine}"
+                        )
+                    recovery_quarantine.rename(archive)
+                    raise ApprovalError(
+                        f"Refusing to restore an Approved file that changed during approval: {archive}"
+                    )
+                if source.exists():
+                    recovery_quarantine.rename(archive)
+                    raise ApprovalError(
+                        f"Refusing to overwrite a new Incoming file during rollback: {source}"
+                    )
+                recovery_quarantine.rename(source)
+                restored_identity = _file_identity(source)
+                if not _matches_owned_file(source, restored_identity, archive_hash, archive_size):
+                    raise ApprovalError("The restored Incoming source failed verification.")
+        except Exception as rollback_exception:
+            rollback_errors.append(f"source recovery: {rollback_exception}")
+        try:
+            if destination_identity is not None and destination.exists():
+                _remove_owned_file_via_quarantine(
+                    destination, destination_identity, expected_hash, expected_size
+                )
+        except Exception as rollback_exception:
+            rollback_errors.append(f"production cleanup: {rollback_exception}")
+        if rollback_errors:
+            fail(
+                "Approval failed and rollback could not safely restore every file; contact IT. "
+                f"Error: {error}. Rollback errors: {'; '.join(rollback_errors)}"
+            )
+        fail(
+            "Approval failed; the source was restored to Incoming and no production copy was retained: "
+            f"{error}"
+        )
     return approved

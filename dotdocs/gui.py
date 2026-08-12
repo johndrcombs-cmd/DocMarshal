@@ -113,6 +113,19 @@ def next_active_source(
     return next((source for source in candidates if source in remaining), remaining_order[0])
 
 
+def approved_record_path(result: dict) -> Path | None:
+    if "approved_archived_file" in result and result.get("approved_archived_file"):
+        archive = Path(result["approved_archived_file"])
+        return archive if archive.is_file() else None
+    source_value = result.get("source_file")
+    source = Path(source_value) if source_value else None
+    return source if source is not None and source.is_file() else None
+
+
+def approved_record_file_exists(result: dict) -> bool:
+    return approved_record_path(result) is not None
+
+
 class DotReviewApp:
     def __init__(self, root: tk.Tk, config: dict, config_path: str | Path | None = None):
         self.root = root
@@ -120,6 +133,7 @@ class DotReviewApp:
         self.config_path = Path(config_path) if config_path is not None else None
         self.incoming = Path(config["scan_incoming"])
         self.processed = Path(config["scan_processed"])
+        self.approved = Path(config["scan_approved"])
         self.exceptions = Path(config["scan_exceptions"])
         self.review_folder = Path(config["scan_review"])
         self.database = Path(config["fleet_database"])
@@ -1325,7 +1339,7 @@ class DotReviewApp:
             for item in self.model.results
             if (
                 item.get("status") == "approved"
-                and Path(item.get("source_file", "")).exists()
+                and approved_record_file_exists(item)
             )
             or (
                 item.get("status") == "duplicate"
@@ -1647,6 +1661,12 @@ class DotReviewApp:
 
     def _sort_preview_path(self, result: dict) -> tuple[Path, Path]:
         status = result.get("status")
+        if status == "approved":
+            approved_path = approved_record_path(result)
+            if approved_path is None:
+                return Path(), self.approved
+            archive_declared = bool(result.get("approved_archived_file"))
+            return approved_path, self.approved if archive_declared else self.incoming
         if status == "duplicate":
             return Path(result.get("duplicate_archived_file") or ""), self.processed / "Duplicates"
         if status == "not_dot":
@@ -1996,6 +2016,7 @@ class DotReviewApp:
                 audit_path=self.audit_path,
                 unit_folders_root=self.unit_root,
                 incoming_folder=self.incoming,
+                approved_folder=self.approved,
                 farm_asset_folders_root=self.farm_unit_root,
                 database_path=self.database,
             )
@@ -2286,7 +2307,18 @@ class DotReviewApp:
         if not result:
             messagebox.showinfo("Select a document", "Select a document to open.")
             return
-        if result.get("status") == "duplicate":
+        if result.get("status") == "approved":
+            path = approved_record_path(result)
+            if path is None:
+                messagebox.showerror("File unavailable", "The approved PDF archive cannot be found.")
+                return
+            if result.get("approved_archived_file"):
+                expected_parent = self.approved.resolve()
+                unsafe_message = "The selected PDF is not directly inside the configured Approved archive."
+            else:
+                expected_parent = self.incoming.resolve()
+                unsafe_message = "The selected PDF is not directly inside the configured Incoming folder."
+        elif result.get("status") == "duplicate":
             path = Path(result.get("duplicate_archived_file") or "")
             expected_parent = (self.processed / "Duplicates").resolve()
             unsafe_message = "The selected PDF is not directly inside the configured duplicate archive."

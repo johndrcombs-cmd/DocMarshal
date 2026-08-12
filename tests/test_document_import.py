@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 import fitz
 
@@ -81,6 +82,36 @@ def test_ocr_preserves_original_and_atomically_publishes_searchable_pdf(tmp_path
     assert pdf_has_searchable_text(source)
     with fitz.open(source) as document:
         assert document.page_count == 1
+
+
+def test_windows_tesseract_runs_without_opening_a_console(monkeypatch, tmp_path):
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    source = incoming / "scan.pdf"
+    _pdf(source)
+    executable = tmp_path / "tesseract.exe"
+    executable.write_bytes(b"exe")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        _pdf(Path(command[2]).with_suffix(".pdf"), "recognized OCR text")
+        return subprocess.CompletedProcess(command, 0, stdout="captured", stderr="")
+
+    monkeypatch.setattr("dotdocs.document_import.os.name", "nt")
+    monkeypatch.setattr("dotdocs.document_import.subprocess.run", fake_run)
+
+    run_pdf_ocr(
+        source,
+        incoming_root=incoming,
+        backup_root=tmp_path / "Processed" / "OCR Originals",
+        tesseract_executable=executable,
+    )
+
+    assert calls
+    assert calls[0][1]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert calls[0][1]["capture_output"] is True
+    assert calls[0][1]["text"] is True
 
 
 def test_finds_standard_per_user_tesseract_install(monkeypatch, tmp_path):
