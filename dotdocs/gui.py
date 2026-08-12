@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import ctypes
+from ctypes import wintypes
 import base64
 from datetime import datetime
 from pathlib import Path
@@ -177,15 +178,73 @@ class DotReviewApp:
     def _apply_app_icon(self) -> None:
         self.app_icon_image = None
         self.header_icon_image = None
+        self.native_icon_handles = []
         try:
             self.app_icon_image = tk.PhotoImage(file=str(APP_ICON_PNG_PATH))
             self.header_icon_image = self.app_icon_image.subsample(8, 8)
             self.root.iconphoto(True, self.app_icon_image)
             if os.name == "nt":
-                self.root.iconbitmap(default=str(APP_ICON_PATH))
+                try:
+                    self.root.iconbitmap(default=str(APP_ICON_PATH))
+                except tk.TclError:
+                    pass
+                self._apply_native_windows_icons()
         except (OSError, tk.TclError):
             self.app_icon_image = None
             self.header_icon_image = None
+
+    def _apply_native_windows_icons(self) -> None:
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x0010
+        SM_CXICON, SM_CYICON = 11, 12
+        SM_CXSMICON, SM_CYSMICON = 49, 50
+
+        try:
+            self.root.update_idletasks()
+            user32 = ctypes.windll.user32
+            user32.LoadImageW.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_wchar_p,
+                ctypes.c_uint,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint,
+            )
+            user32.LoadImageW.restype = ctypes.c_void_p
+            user32.GetParent.argtypes = (wintypes.HWND,)
+            user32.GetParent.restype = wintypes.HWND
+            user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+            user32.GetSystemMetrics.restype = ctypes.c_int
+            user32.SendMessageW.argtypes = (
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+            window_id = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            sizes = (
+                (ICON_SMALL, user32.GetSystemMetrics(SM_CXSMICON), user32.GetSystemMetrics(SM_CYSMICON)),
+                (ICON_BIG, user32.GetSystemMetrics(SM_CXICON), user32.GetSystemMetrics(SM_CYICON)),
+            )
+            for icon_kind, width, height in sizes:
+                handle = user32.LoadImageW(
+                    None,
+                    str(APP_ICON_PATH),
+                    IMAGE_ICON,
+                    width,
+                    height,
+                    LR_LOADFROMFILE,
+                )
+                if handle:
+                    icon_value = ctypes.cast(handle, ctypes.c_void_p).value
+                    user32.SendMessageW(window_id, WM_SETICON, icon_kind, icon_value)
+                    self.native_icon_handles.append(handle)
+        except (AttributeError, OSError, tk.TclError):
+            self.native_icon_handles = []
 
     @staticmethod
     def _humanize_user_text(value: object) -> str:

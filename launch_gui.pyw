@@ -1,6 +1,13 @@
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
+
+APP_USER_MODEL_ID = "LittleBs.DocMarshal.Desktop"
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = (wintypes.LPCWSTR,)
+shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+identity_result = shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+
 from tkinter import messagebox
 
 from dotdocs.gui import launch

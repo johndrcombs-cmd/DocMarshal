@@ -110,6 +110,34 @@ def test_docmarshal_branding_declares_product_name_and_icon():
     assert gui.APP_ICON_PATH.is_file()
 
 
+def test_windows_window_icon_sets_both_native_taskbar_icon_sizes():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert "LoadImageW" in source
+    assert "WM_SETICON" in source
+    assert "ICON_SMALL" in source
+    assert "ICON_BIG" in source
+    assert "self.native_icon_handles" in source
+    assert "user32.GetParent.argtypes = (wintypes.HWND,)" in source
+    assert "user32.GetParent.restype = wintypes.HWND" in source
+    assert "user32.SendMessageW.argtypes" in source
+    assert "user32.SendMessageW.restype = ctypes.c_ssize_t" in source
+    assert "user32.GetSystemMetrics.argtypes = (ctypes.c_int,)" in source
+
+
+def test_windows_launcher_sets_docmarshal_taskbar_identity_before_tk_import():
+    launcher = Path(gui.__file__).resolve().parents[1] / "launch_gui.pyw"
+    source = launcher.read_text(encoding="utf-8")
+
+    identity_call = source.index("identity_result = shell32.SetCurrentProcessExplicitAppUserModelID")
+    tkinter_import = source.index("from tkinter import messagebox")
+    gui_import = source.index("from dotdocs.gui import launch")
+
+    assert 'APP_USER_MODEL_ID = "LittleBs.DocMarshal.Desktop"' in source
+    assert identity_call < tkinter_import
+    assert identity_call < gui_import
+
+
 def test_main_window_declares_four_primary_navigation_tabs():
     source = Path(gui.__file__).read_text(encoding="utf-8")
 
