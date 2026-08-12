@@ -4,6 +4,11 @@ import queue
 from dotdocs import gui
 
 
+def _gui_sources() -> str:
+    gui_path = Path(gui.__file__)
+    return gui_path.read_text(encoding="utf-8") + (gui_path.parent / "ui_layout.py").read_text(encoding="utf-8")
+
+
 class _Value:
     def __init__(self, value=None):
         self.value = value
@@ -40,11 +45,15 @@ class _Model:
 
 
 class _Widget:
-    def __init__(self):
+    def __init__(self, children=()):
         self.bindings = {}
+        self.children = tuple(children)
 
     def bind(self, sequence, callback):
         self.bindings[sequence] = callback
+
+    def winfo_children(self):
+        return self.children
 
 
 class _ScrollableWidget(_Widget):
@@ -86,22 +95,69 @@ def test_document_type_choices_include_distinct_registration_documents():
     assert gui.DOCUMENT_TYPE_LABELS["CAB"] == "CAB Card"
 
 
-def test_fixed_dark_theme_declares_complete_glass_palette():
+def test_fixed_dark_theme_declares_professional_command_center_palette():
     assert gui.DARK_THEME == {
-        "window": "#07111F",
-        "surface": "#0D1B2A",
-        "surface_hover": "#132A42",
-        "input": "#081523",
-        "border": "#204467",
-        "border_focus": "#2F81F7",
-        "accent": "#F59E0B",
-        "accent_hover": "#FFB21A",
-        "text": "#F0F6FC",
-        "muted": "#8DA6C0",
-        "success": "#3FB950",
-        "warning": "#D29922",
-        "danger": "#F85149",
+        "window": "#080D14",
+        "navigation": "#0D141F",
+        "surface": "#111A27",
+        "raised": "#162131",
+        "input": "#1B293A",
+        "surface_hover": "#22334A",
+        "border": "#2A3B50",
+        "border_focus": "#27C2D1",
+        "accent": "#F5A814",
+        "accent_hover": "#FFB92E",
+        "cyan": "#27C2D1",
+        "teal": "#27D3A2",
+        "indigo": "#8B7CF6",
+        "magenta": "#D65AD1",
+        "text": "#F3F7FB",
+        "secondary": "#A8B5C5",
+        "muted": "#68778A",
+        "success": "#28C890",
+        "warning": "#F2B84B",
+        "danger": "#F06464",
     }
+
+
+def test_sort_workspace_declares_compact_shell_three_panes_and_reset_control():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+    layout_source = (Path(gui.__file__).parent / "ui_layout.py").read_text(encoding="utf-8")
+
+    assert 'self.root.geometry("1920x1080")' in source
+    assert "app.sort_queue_pane" in layout_source
+    assert "app.sort_viewer_pane" in layout_source
+    assert "app.sort_inspector_pane" in layout_source
+    assert 'text="Reset Layout"' in layout_source
+    assert "def _reset_sort_panes" in source
+
+
+def test_review_inspector_exposes_existing_file_details_without_new_actions():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+    layout_source = (Path(gui.__file__).parent / "ui_layout.py").read_text(encoding="utf-8")
+
+    assert "self.source_filename_var" in source
+    assert "self.proposed_filename_var" in source
+    assert "self.owner_status_var" in source
+    assert "app.selection_count_var" in layout_source
+    assert 'text="Approve and File Copy"' in layout_source
+    assert 'text="Save Correction"' in layout_source
+    assert 'text="Mark Duplicate"' in layout_source
+    assert 'text="Not a DOT Document"' in layout_source
+
+
+def test_scaled_sort_layout_keeps_reset_and_inspector_content_reachable():
+    layout_source = (Path(gui.__file__).parent / "ui_layout.py").read_text(encoding="utf-8")
+
+    assert '"file": "File"' in layout_source
+    assert "app.inspector_canvas = tk.Canvas" in layout_source
+    assert "app._bind_canvas_mouse_wheel(app.inspector_canvas)" in layout_source
+    assert 'text="Reset Layout"' in layout_source
+    assert "status.pack(side=\"bottom\"" in layout_source
+    assert 'text="↶"' in layout_source
+    assert 'text="↷"' in layout_source
+    assert '"file": 72' in layout_source
+    assert '"date": 72' in layout_source
 
 
 def test_docmarshal_branding_declares_product_name_and_icon():
@@ -139,24 +195,24 @@ def test_windows_launcher_sets_docmarshal_taskbar_identity_before_tk_import():
 
 
 def test_main_window_declares_four_primary_navigation_tabs():
-    source = Path(gui.__file__).read_text(encoding="utf-8")
+    source = _gui_sources()
 
     assert "ttk.Notebook" in source
-    assert 'text="Sort"' in source
-    assert 'text="Database"' in source
-    assert 'text="Settings"' in source
-    assert 'text="Virtual Binder"' in source
+    assert '"Sort"' in source
+    assert '"Database"' in source
+    assert '"Settings"' in source
+    assert '"Virtual Binder"' in source
     assert "_build_database_tab" in source
     assert "_build_settings_tab" in source
     assert "_build_binder_tab" in source
 
 
 def test_sort_and_virtual_binder_expose_import_ocr_zoom_and_sequence_controls():
-    source = Path(gui.__file__).read_text(encoding="utf-8")
+    source = _gui_sources()
 
-    assert 'text="Import PDFs"' in source
-    assert 'text="Run OCR on Selected"' in source
-    assert 'text="Run OCR on All Needing OCR"' in source
+    assert "Import PDFs" in source
+    assert "OCR Selected" in source
+    assert "OCR All Needing OCR" in source
     assert "NON_DOT_DOCUMENT_TYPES" in source
     assert 'text="Classify and Archive"' in source
     assert "classification=classification" in source
@@ -170,9 +226,8 @@ def test_sort_and_virtual_binder_expose_import_ocr_zoom_and_sequence_controls():
     assert "_render_selected_sort_page" in source
     assert 'text="‹ Previous"' in source
     assert 'text="Next ›"' in source
-    assert 'text="Rotate Preview"' in source
-    assert 'text="Left"' in source
-    assert 'text="Right"' in source
+    assert "_rotate_sort_page(-90)" in source
+    assert "_rotate_sort_page(90)" in source
     assert 'text="Select All Visible"' in source
     assert 'selectmode="extended"' in source
 
@@ -191,10 +246,26 @@ def test_canvas_mouse_wheel_bindings_scroll_vertically_and_stop_propagation():
     assert canvas.scrolls == [(-1, "units"), (1, "units"), (-1, "units"), (1, "units")]
 
 
-def test_all_scrollable_document_surfaces_receive_mouse_wheel_bindings():
-    source = Path(gui.__file__).read_text(encoding="utf-8")
+def test_embedded_widget_tree_routes_mouse_wheel_to_its_canvas():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    canvas = _ScrollableWidget()
+    entry = _Widget()
+    label = _Widget()
+    nested_frame = _Widget((entry, label))
+    inspector = _Widget((nested_frame,))
 
-    assert "self._bind_canvas_mouse_wheel(self.sort_page_canvas)" in source
+    app._bind_mouse_wheel_to_widget_tree(canvas, inspector)
+
+    for widget in (inspector, nested_frame, entry, label):
+        assert set(widget.bindings) == {"<MouseWheel>", "<Button-4>", "<Button-5>"}
+    assert entry.bindings["<MouseWheel>"](type("Event", (), {"delta": -120})()) == "break"
+    assert canvas.scrolls == [(1, "units")]
+
+
+def test_all_scrollable_document_surfaces_receive_mouse_wheel_bindings():
+    source = _gui_sources()
+
+    assert "app._bind_canvas_mouse_wheel(app.sort_page_canvas)" in source
     assert "self._bind_canvas_mouse_wheel(self.binder_shelf)" in source
     assert "self._bind_canvas_mouse_wheel(self.binder_page_canvas)" in source
 

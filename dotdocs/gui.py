@@ -40,6 +40,7 @@ from .document_import import (
 from .naming import DOCUMENT_TYPE_CHOICES
 from .processor import analyze_pdf
 from .settings import SETTING_DEFINITIONS, save_user_settings
+from .ui_layout import build_application_ui
 from .review import (
     NON_DOT_DOCUMENT_TYPES,
     ApprovalError,
@@ -61,19 +62,26 @@ APP_ICON_PATH = ASSET_DIR / "docmarshal.ico"
 APP_ICON_PNG_PATH = ASSET_DIR / "docmarshal-icon.png"
 
 DARK_THEME = {
-    "window": "#07111F",
-    "surface": "#0D1B2A",
-    "surface_hover": "#132A42",
-    "input": "#081523",
-    "border": "#204467",
-    "border_focus": "#2F81F7",
-    "accent": "#F59E0B",
-    "accent_hover": "#FFB21A",
-    "text": "#F0F6FC",
-    "muted": "#8DA6C0",
-    "success": "#3FB950",
-    "warning": "#D29922",
-    "danger": "#F85149",
+    "window": "#080D14",
+    "navigation": "#0D141F",
+    "surface": "#111A27",
+    "raised": "#162131",
+    "input": "#1B293A",
+    "surface_hover": "#22334A",
+    "border": "#2A3B50",
+    "border_focus": "#27C2D1",
+    "accent": "#F5A814",
+    "accent_hover": "#FFB92E",
+    "cyan": "#27C2D1",
+    "teal": "#27D3A2",
+    "indigo": "#8B7CF6",
+    "magenta": "#D65AD1",
+    "text": "#F3F7FB",
+    "secondary": "#A8B5C5",
+    "muted": "#68778A",
+    "success": "#28C890",
+    "warning": "#F2B84B",
+    "danger": "#F06464",
 }
 
 DOCUMENT_TYPE_LABELS = {
@@ -139,8 +147,8 @@ class DotReviewApp:
         self.model = ReviewModel(initial_results)
 
         self.root.title(APP_NAME)
-        self.root.geometry("1440x1000")
-        self.root.minsize(1180, 1000)
+        self.root.geometry("1920x1080")
+        self.root.minsize(1280, 820)
         self.root.configure(background=DARK_THEME["window"])
         self._apply_app_icon()
         self._build_ui()
@@ -174,6 +182,13 @@ class DotReviewApp:
         canvas.bind("<MouseWheel>", callback)
         canvas.bind("<Button-4>", callback)
         canvas.bind("<Button-5>", callback)
+
+    def _bind_mouse_wheel_to_widget_tree(self, canvas: tk.Canvas, widget: tk.Widget) -> None:
+        callback = lambda event: self._scroll_canvas_with_mouse_wheel(canvas, event)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, callback)
+        for child in widget.winfo_children():
+            self._bind_mouse_wheel_to_widget_tree(canvas, child)
 
     def _apply_app_icon(self) -> None:
         self.app_icon_image = None
@@ -302,6 +317,7 @@ class DotReviewApp:
         self.root.option_add("*TCombobox*Listbox.selectForeground", theme["text"])
 
         style.configure("TFrame", background=theme["window"])
+        style.configure("Navigation.TFrame", background=theme["navigation"])
         style.configure(
             "Glass.TFrame",
             background=theme["surface"],
@@ -312,18 +328,21 @@ class DotReviewApp:
             relief="solid",
         )
         style.configure("GlassContent.TFrame", background=theme["surface"], borderwidth=0)
+        style.configure("Raised.TFrame", background=theme["raised"], borderwidth=0)
         style.configure("TLabel", background=theme["window"], foreground=theme["text"])
         style.configure("Glass.TLabel", background=theme["surface"], foreground=theme["text"])
+        style.configure("Raised.TLabel", background=theme["raised"], foreground=theme["text"])
+        style.configure("Navigation.TLabel", background=theme["navigation"], foreground=theme["text"])
         style.configure(
             "Header.TLabel",
             background=theme["surface"],
             foreground=theme["text"],
-            font=("Segoe UI Variable Display", 19, "bold"),
+            font=("Segoe UI Variable Display", 17, "bold"),
         )
         style.configure(
             "Subtitle.TLabel",
             background=theme["surface"],
-            foreground=theme["muted"],
+            foreground=theme["secondary"],
             font=("Segoe UI", 9),
         )
         style.configure(
@@ -334,23 +353,20 @@ class DotReviewApp:
         )
         style.configure(
             "Count.TLabel",
-            background=theme["surface"],
-            foreground=theme["text"],
-            font=("Segoe UI", 10, "bold"),
-            padding=(14, 9),
-            anchor="center",
-            bordercolor=theme["border"],
-            borderwidth=1,
-            relief="solid",
+            background=theme["raised"], foreground=theme["text"],
+            font=("Segoe UI", 10, "bold"), padding=(12, 8), anchor="w", borderwidth=0,
         )
+        for name, color in (("Total", theme["cyan"]), ("Ready", theme["teal"]),
+                            ("Review", theme["warning"]), ("Approved", theme["indigo"]),
+                            ("Failed", theme["danger"]), ("Duplicate", theme["magenta"]),
+                            ("NotDot", theme["secondary"])):
+            style.configure(f"{name}.Count.TLabel", foreground=color)
         style.configure(
             "Status.TLabel",
-            background=theme["surface"],
-            foreground=theme["muted"],
-            padding=(14, 9),
-            bordercolor=theme["border"],
-            borderwidth=1,
-            relief="solid",
+            background=theme["navigation"],
+            foreground=theme["secondary"],
+            padding=(10, 6),
+            borderwidth=0,
         )
         style.configure(
             "Glass.TLabelframe",
@@ -376,7 +392,7 @@ class DotReviewApp:
             bordercolor=theme["border"],
             lightcolor=theme["border"],
             darkcolor=theme["border"],
-            padding=(9, 7),
+            padding=(8, 5),
         )
         style.map(
             "TEntry",
@@ -393,7 +409,7 @@ class DotReviewApp:
             bordercolor=theme["border"],
             lightcolor=theme["border"],
             darkcolor=theme["border"],
-            padding=(8, 6),
+            padding=(7, 5),
         )
         style.map(
             "TCombobox",
@@ -412,7 +428,7 @@ class DotReviewApp:
             darkcolor=theme["border"],
             focusthickness=2,
             focuscolor=theme["border_focus"],
-            padding=(12, 8),
+            padding=(10, 6),
             font=("Segoe UI", 9, "bold"),
         )
         style.map(
@@ -428,7 +444,7 @@ class DotReviewApp:
             bordercolor=theme["accent"],
             lightcolor=theme["accent"],
             darkcolor=theme["accent"],
-            padding=(15, 9),
+            padding=(13, 7),
         )
         style.map(
             "Primary.TButton",
@@ -449,13 +465,13 @@ class DotReviewApp:
             bordercolor=theme["border"],
             lightcolor=theme["border"],
             darkcolor=theme["border"],
-            rowheight=30,
+            rowheight=34,
             font=("Segoe UI", 9),
         )
         style.map(
             "Treeview",
-            background=[("selected", theme["accent"])],
-            foreground=[("selected", theme["window"])],
+            background=[("selected", theme["surface_hover"])],
+            foreground=[("selected", theme["text"])],
         )
         style.configure(
             "Treeview.Heading",
@@ -483,312 +499,60 @@ class DotReviewApp:
                 scrollbar_style,
                 background=[("active", theme["border"]), ("pressed", theme["accent"])],
             )
-        style.configure("TPanedwindow", background=theme["window"], sashwidth=8)
+        style.configure("TPanedwindow", background=theme["window"], sashwidth=6)
         style.configure(
             "TNotebook",
-            background=theme["window"],
-            bordercolor=theme["border"],
+            background=theme["navigation"],
+            bordercolor=theme["navigation"],
             tabmargins=(0, 0, 0, 0),
         )
         style.configure(
             "TNotebook.Tab",
-            background=theme["surface"],
+            background=theme["navigation"],
             foreground=theme["muted"],
-            bordercolor=theme["border"],
-            padding=(22, 10),
+            bordercolor=theme["navigation"],
+            padding=(22, 8),
             font=("Segoe UI", 10, "bold"),
         )
         style.map(
             "TNotebook.Tab",
-            background=[("selected", theme["surface_hover"]), ("active", theme["border"])],
+            background=[("selected", theme["raised"]), ("active", theme["surface_hover"])],
             foreground=[("selected", theme["text"]), ("active", theme["text"])],
-            bordercolor=[("selected", theme["accent"])],
+            bordercolor=[("selected", theme["cyan"])],
         )
         return style
 
     def _build_ui(self) -> None:
-        self._configure_theme()
-
-        header = ttk.Frame(self.root, style="Glass.TFrame", padding=(18, 14))
-        header.pack(fill="x", padx=16, pady=(16, 10))
-        if self.header_icon_image is not None:
-            ttk.Label(header, image=self.header_icon_image, style="Glass.TLabel").pack(side="left", padx=(0, 12))
-        title_group = ttk.Frame(header, style="GlassContent.TFrame")
-        title_group.pack(side="left")
-        ttk.Label(title_group, text=APP_NAME, style="Header.TLabel").pack(anchor="w")
-        ttk.Label(
-            title_group,
-            text="Review, verify, and file fleet documents safely",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
-        self.scan_button = ttk.Button(
-            header,
-            text="Scan Incoming Documents",
-            command=self.scan_incoming,
-            style="Primary.TButton",
+        build_application_ui(
+            self,
+            app_name=APP_NAME,
+            theme=DARK_THEME,
+            document_type_choices=DOCUMENT_TYPE_CHOICES,
+            document_type_labels=DOCUMENT_TYPE_LABELS,
         )
-        self.scan_button.pack(side="right", padx=(12, 0))
 
-        self.navigation = ttk.Notebook(self.root)
-        self.navigation.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        self.sort_tab = ttk.Frame(self.navigation)
-        self.database_tab = ttk.Frame(self.navigation)
-        self.settings_tab = ttk.Frame(self.navigation)
-        self.binder_tab = ttk.Frame(self.navigation)
-        self.navigation.add(self.sort_tab, text="Sort")
-        self.navigation.add(self.database_tab, text="Database")
-        self.navigation.add(self.settings_tab, text="Settings")
-        self.navigation.add(self.binder_tab, text="Virtual Binder")
-        self.navigation.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+    def _reset_sort_panes(self) -> None:
+        if not hasattr(self, "sort_workspace"):
+            return
+        self.sort_workspace.update_idletasks()
+        width = self.sort_workspace.winfo_width()
+        if width > 900:
+            self.sort_workspace.sashpos(0, round(width * 0.29))
+            self.sort_workspace.sashpos(1, round(width * 0.72))
 
-        counters = ttk.Frame(self.sort_tab)
-        counters.pack(fill="x", padx=16, pady=(0, 10))
-        self.count_labels = {}
-        for key, title in (
-            ("total", "Total"),
-            ("ready", "Ready"),
-            ("needs_review", "Needs Review"),
-            ("approved", "Approved"),
-            ("failed", "Failed"),
-            ("duplicate", "Duplicates"),
-            ("not_dot", "Not DOT"),
+    def _set_review_action_state(self, selected: bool) -> None:
+        state = "normal" if selected else "disabled"
+        for widget in (
+            self.open_pdf_button,
+            self.open_destination_button,
+            self.ocr_button,
+            self.save_correction_button,
+            self.approve_button,
+            self.duplicate_button,
+            self.not_dot_button,
+            self.restore_button,
         ):
-            label = ttk.Label(counters, text=f"{title}  •  0", style="Count.TLabel")
-            label.pack(side="left", fill="x", expand=True, padx=(0, 8 if key != "not_dot" else 0))
-            self.count_labels[key] = (label, title)
-
-        progress_frame = ttk.Frame(self.sort_tab, style="Glass.TFrame", padding=(14, 9))
-        progress_frame.pack(fill="x", padx=16, pady=(0, 10))
-        self.progress = ttk.Progressbar(progress_frame, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True)
-        self.progress_text = ttk.Label(progress_frame, text="Ready", style="Glass.TLabel")
-        self.progress_text.pack(side="left", padx=(10, 0))
-        self.bulk_ocr_button = ttk.Button(
-            progress_frame,
-            text="Run OCR on All Needing OCR",
-            command=self.run_ocr_on_all,
-        )
-        self.bulk_ocr_button.pack(side="right", padx=(12, 0))
-
-        toolbar = ttk.Frame(self.sort_tab, style="Glass.TFrame", padding=(12, 10))
-        toolbar.pack(fill="x", padx=16, pady=(0, 10))
-        ttk.Label(toolbar, text="Show Documents", style="Field.TLabel").pack(side="left")
-        self.filter_var = tk.StringVar(value="Active")
-        filter_box = ttk.Combobox(
-            toolbar,
-            textvariable=self.filter_var,
-            values=("Active", "All", "Ready", "Needs Review", "Approved", "Duplicates", "Not DOT", "Failed"),
-            state="readonly",
-            width=18,
-        )
-        filter_box.pack(side="left", padx=(6, 12))
-        filter_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_table())
-        self.import_button = ttk.Button(toolbar, text="Import PDFs", command=self.import_documents)
-        self.import_button.pack(side="left", padx=3)
-        self.ocr_button = ttk.Button(toolbar, text="Run OCR on Selected", command=self.run_ocr_on_selected)
-        self.ocr_button.pack(side="left", padx=3)
-        ttk.Button(toolbar, text="Open PDF", command=self.open_pdf).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="Open Destination", command=self.open_destination).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="Add New Asset", command=self.add_new_asset).pack(side="left", padx=(14, 3))
-        ttk.Button(toolbar, text="Restore Active", command=self.restore_selected).pack(side="left", padx=3)
-
-        sort_workspace = ttk.Panedwindow(self.sort_tab, orient="horizontal")
-        sort_workspace.pack(fill="both", expand=True, padx=16, pady=(0, 10))
-        queue_workspace = ttk.Panedwindow(sort_workspace, orient="vertical")
-        sort_workspace.add(queue_workspace, weight=1)
-
-        table_frame = ttk.Frame(queue_workspace, style="Glass.TFrame", padding=1)
-        queue_workspace.add(table_frame, weight=2)
-        selection_toolbar = ttk.Frame(table_frame, style="GlassContent.TFrame", padding=(8, 5))
-        selection_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
-        self.select_all_button = ttk.Button(
-            selection_toolbar,
-            text="Select All Visible",
-            command=self.select_all_visible,
-        )
-        self.select_all_button.pack(side="left")
-        ttk.Label(
-            selection_toolbar,
-            text="Use Ctrl or Shift to select multiple documents",
-            style="Muted.TLabel",
-        ).pack(side="left", padx=(10, 0))
-        columns = ("file", "status", "unit", "owner", "type", "date", "filename", "reason")
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
-        headings = {
-            "file": "Source File",
-            "status": "Status",
-            "unit": "Unit",
-            "owner": "Ownership",
-            "type": "Document Type",
-            "date": "Controlling Date",
-            "filename": "Proposed Filename",
-            "reason": "Review Notes",
-        }
-        widths = {"file": 105, "status": 80, "unit": 45, "owner": 65, "type": 95, "date": 90, "filename": 120, "reason": 140}
-        for column in columns:
-            self.table.heading(column, text=headings[column])
-            self.table.column(
-                column,
-                width=widths[column],
-                minwidth=widths[column],
-                stretch=column == "reason",
-                anchor="w",
-            )
-        vertical_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-        horizontal_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
-        self.table.configure(yscrollcommand=vertical_scroll.set, xscrollcommand=horizontal_scroll.set)
-        self.table.grid(row=1, column=0, sticky="nsew")
-        vertical_scroll.grid(row=1, column=1, sticky="ns")
-        horizontal_scroll.grid(row=2, column=0, sticky="ew")
-        table_frame.rowconfigure(1, weight=1)
-        table_frame.columnconfigure(0, weight=1)
-        self.table.bind("<<TreeviewSelect>>", self._on_selection)
-        self.table.bind("<Double-1>", lambda _event: self.open_pdf())
-        self.table.tag_configure("needs_review", background="#2A2213", foreground="#FFD98A")
-        self.table.tag_configure("ready_for_review", background="#13251B", foreground="#8FE09B")
-        self.table.tag_configure("approved", background="#112338", foreground="#9CCBFF")
-        self.table.tag_configure("failed", background="#30181B", foreground="#FFAAA5")
-        self.table.tag_configure("duplicate", background="#1B202A", foreground="#B8C2D1")
-        self.table.tag_configure("not_dot", background="#1B202A", foreground="#B8C2D1")
-
-        review_panel = ttk.LabelFrame(
-            queue_workspace,
-            text="Review Selected Document",
-            style="Glass.TLabelframe",
-            padding=(14, 12),
-        )
-        queue_workspace.add(review_panel, weight=3)
-        self.unit_var = tk.StringVar()
-        self.type_var = tk.StringVar()
-        self.date_var = tk.StringVar()
-        self.page_var = tk.StringVar()
-        self.destination_var = tk.StringVar()
-        self.reason_var = tk.StringVar()
-
-        ttk.Label(review_panel, text="Unit", style="Field.TLabel").grid(row=0, column=0, sticky="w")
-        unit_entry = ttk.Entry(review_panel, textvariable=self.unit_var, width=14)
-        unit_entry.grid(row=1, column=0, sticky="ew", padx=(0, 10))
-        ttk.Label(review_panel, text="Document Type", style="Field.TLabel").grid(row=0, column=1, sticky="w")
-        ttk.Combobox(
-            review_panel,
-            textvariable=self.type_var,
-            values=tuple(DOCUMENT_TYPE_LABELS[code] for code in DOCUMENT_TYPE_CHOICES),
-            state="readonly",
-            width=22,
-        ).grid(row=1, column=1, sticky="ew", padx=(0, 10))
-        ttk.Label(review_panel, text="Controlling Date  •  M/D/YY or M/D/YYYY", style="Field.TLabel").grid(row=0, column=2, sticky="w")
-        date_entry = ttk.Entry(review_panel, textvariable=self.date_var, width=24)
-        date_entry.grid(row=1, column=2, sticky="ew", padx=(0, 10))
-        self._bind_approval_on_enter(unit_entry, date_entry)
-        ttk.Label(review_panel, text="Additional Page", style="Field.TLabel").grid(row=0, column=3, sticky="w")
-        ttk.Combobox(
-            review_panel,
-            textvariable=self.page_var,
-            values=("", "PG2", "PG3", "PG4", "PG5", "PG6", "PG7", "PG8", "PG9", "PG10"),
-            width=9,
-        ).grid(row=1, column=3, sticky="ew", padx=(0, 10))
-        action_bar = ttk.Frame(review_panel, style="GlassContent.TFrame")
-        action_bar.grid(row=2, column=0, columnspan=8, sticky="e", pady=(12, 2))
-        self.save_correction_button = ttk.Button(action_bar, text="Save Correction", command=self.save_correction)
-        self.save_correction_button.pack(side="left", padx=(0, 8))
-        self.approve_button = ttk.Button(
-            action_bar,
-            text="Approve and File Copy",
-            command=self.approve_selected,
-            style="Primary.TButton",
-        )
-        self.approve_button.pack(side="left")
-        self.duplicate_button = ttk.Button(
-            action_bar,
-            text="Mark Duplicate",
-            command=self.mark_selected_duplicate,
-            style="Warning.TButton",
-        )
-        self.duplicate_button.pack(side="left", padx=(8, 0))
-        self.not_dot_button = ttk.Button(
-            action_bar,
-            text="Not a DOT Document",
-            command=self.mark_selected_not_dot,
-            style="Danger.TButton",
-        )
-        self.not_dot_button.pack(side="left", padx=(8, 0))
-        ttk.Label(review_panel, text="Review Notes", style="Field.TLabel").grid(row=3, column=0, sticky="nw", pady=(8, 0))
-        ttk.Label(review_panel, textvariable=self.reason_var, wraplength=1100, style="Glass.TLabel").grid(
-            row=3, column=1, columnspan=7, sticky="w", pady=(8, 0)
-        )
-        ttk.Label(review_panel, text="Destination", style="Field.TLabel").grid(row=4, column=0, sticky="nw", pady=(7, 0))
-        ttk.Label(review_panel, textvariable=self.destination_var, wraplength=1100, style="Glass.TLabel").grid(
-            row=4, column=1, columnspan=7, sticky="w", pady=(7, 0)
-        )
-        review_panel.columnconfigure(2, weight=1)
-
-        viewer = ttk.LabelFrame(
-            sort_workspace,
-            text="Document Viewer",
-            style="Glass.TLabelframe",
-            padding=(10, 8),
-        )
-        sort_workspace.add(viewer, weight=1)
-        viewer_toolbar = ttk.Frame(viewer, style="GlassContent.TFrame")
-        viewer_toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Button(viewer_toolbar, text="−", width=3, command=lambda: self._change_sort_zoom(-0.25)).pack(side="left")
-        self.sort_zoom_var = tk.StringVar(value="100%")
-        ttk.Label(viewer_toolbar, textvariable=self.sort_zoom_var, style="Glass.TLabel", width=6, anchor="center").pack(
-            side="left", padx=3
-        )
-        ttk.Button(viewer_toolbar, text="Fit", width=5, command=self._fit_sort_page).pack(side="left", padx=3)
-        ttk.Button(viewer_toolbar, text="+", width=3, command=lambda: self._change_sort_zoom(0.25)).pack(side="left")
-
-        rotation_toolbar = ttk.Frame(viewer, style="GlassContent.TFrame")
-        rotation_toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Label(rotation_toolbar, text="Rotate Preview", style="Glass.TLabel").pack(side="left")
-        ttk.Button(rotation_toolbar, text="Left", width=7, command=lambda: self._rotate_sort_page(-90)).pack(
-            side="left", padx=(8, 3)
-        )
-        ttk.Button(rotation_toolbar, text="Right", width=7, command=lambda: self._rotate_sort_page(90)).pack(side="left")
-
-        sort_canvas_frame = ttk.Frame(viewer, style="GlassContent.TFrame")
-        sort_canvas_frame.pack(fill="both", expand=True)
-        self.sort_page_canvas = tk.Canvas(
-            sort_canvas_frame,
-            background=DARK_THEME["input"],
-            highlightbackground=DARK_THEME["border"],
-            highlightthickness=1,
-        )
-        sort_vertical = ttk.Scrollbar(sort_canvas_frame, orient="vertical", command=self.sort_page_canvas.yview)
-        sort_horizontal = ttk.Scrollbar(sort_canvas_frame, orient="horizontal", command=self.sort_page_canvas.xview)
-        self.sort_page_canvas.configure(yscrollcommand=sort_vertical.set, xscrollcommand=sort_horizontal.set)
-        self._bind_canvas_mouse_wheel(self.sort_page_canvas)
-        self.sort_page_canvas.grid(row=0, column=0, sticky="nsew")
-        sort_vertical.grid(row=0, column=1, sticky="ns")
-        sort_horizontal.grid(row=1, column=0, sticky="ew")
-        sort_canvas_frame.rowconfigure(0, weight=1)
-        sort_canvas_frame.columnconfigure(0, weight=1)
-
-        viewer_navigation = ttk.Frame(viewer, style="GlassContent.TFrame")
-        viewer_navigation.pack(fill="x", pady=(8, 0))
-        ttk.Button(viewer_navigation, text="‹ Previous", command=lambda: self._turn_sort_page(-1)).pack(side="left")
-        self.sort_page_status_var = tk.StringVar(value="No document selected")
-        ttk.Label(viewer_navigation, textvariable=self.sort_page_status_var, style="Glass.TLabel", anchor="center").pack(
-            side="left", fill="x", expand=True, padx=8
-        )
-        ttk.Button(viewer_navigation, text="Next ›", command=lambda: self._turn_sort_page(1)).pack(side="right")
-        self.sort_page_index = 0
-        self.sort_page_count = 0
-        self.sort_page_image = None
-        self.sort_zoom_factor = 1.0
-        self.sort_page_rotations = {}
-        self.sort_preview_generation = 0
-        self._set_sort_page_message("Select a document to preview it here.")
-
-        self.status_var = tk.StringVar(value="Ready. Click Scan Incoming Documents to analyze PDFs.")
-        ttk.Label(self.sort_tab, textvariable=self.status_var, style="Status.TLabel", anchor="w").pack(
-            side="bottom", fill="x", padx=16, pady=(0, 10), before=sort_workspace
-        )
-
-        self._build_database_tab()
-        self._build_settings_tab()
-        self._build_binder_tab()
+            widget.configure(state=state)
 
     def _on_tab_changed(self, _event=None) -> None:
         selected = self.navigation.select()
@@ -798,9 +562,9 @@ class DotReviewApp:
             self._refresh_binder_shelf()
 
     def _build_database_tab(self) -> None:
-        toolbar = ttk.Frame(self.database_tab, style="Glass.TFrame", padding=(12, 10))
-        toolbar.pack(fill="x", padx=12, pady=(12, 8))
-        ttk.Label(toolbar, text="Search Assets", style="Field.TLabel").pack(side="left")
+        toolbar = ttk.Frame(self.database_tab, style="Glass.TFrame", padding=(10, 8))
+        toolbar.pack(fill="x", padx=12, pady=(10, 6))
+        ttk.Label(toolbar, text="FLEET ASSET DATABASE", style="Field.TLabel").pack(side="left", padx=(0, 14))
         self.database_search_var = tk.StringVar()
         search = ttk.Entry(toolbar, textvariable=self.database_search_var, width=28)
         search.pack(side="left", padx=(8, 10))
@@ -812,7 +576,7 @@ class DotReviewApp:
         ttk.Button(toolbar, text="Import XLSX", command=self._import_database).pack(side="right", padx=3)
 
         pane = ttk.Panedwindow(self.database_tab, orient="vertical")
-        pane.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        pane.pack(fill="both", expand=True, padx=12, pady=(0, 6))
         table_frame = ttk.Frame(pane, style="Glass.TFrame", padding=1)
         editor = ttk.LabelFrame(
             pane,
@@ -820,8 +584,8 @@ class DotReviewApp:
             style="Glass.TLabelframe",
             padding=(12, 10),
         )
-        pane.add(table_frame, weight=2)
-        pane.add(editor, weight=2)
+        pane.add(table_frame, weight=4)
+        pane.add(editor, weight=1)
 
         columns = ("unit", "owner", "type", "year", "make", "model", "plate", "vin", "dot")
         self.database_table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
@@ -1018,37 +782,56 @@ class DotReviewApp:
         self.database_status_var.set(f"Complete database exported to {path}")
 
     def _build_settings_tab(self) -> None:
-        panel = ttk.LabelFrame(
-            self.settings_tab,
-            text="Installation and Folder Settings",
-            style="Glass.TLabelframe",
-            padding=(18, 14),
-        )
-        panel.pack(fill="both", expand=True, padx=12, pady=12)
+        heading = ttk.Frame(self.settings_tab, style="Glass.TFrame", padding=(14, 10))
+        heading.pack(fill="x", padx=12, pady=(10, 6))
         ttk.Label(
-            panel,
-            text="Choose paths for this DocMarshal installation. Saved changes take effect after restarting the app.",
+            heading,
+            text="INSTALLATION SETTINGS",
+            style="Field.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            heading,
+            text="Local paths for document intake, processing data, and virtual binders. Changes apply after restart.",
             style="Glass.TLabel",
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        ).pack(anchor="w", pady=(3, 0))
+        groups = ttk.Frame(self.settings_tab)
+        groups.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        processing_panel = ttk.LabelFrame(
+            groups, text="Document Processing", style="Glass.TLabelframe", padding=(14, 10)
+        )
+        processing_panel.pack(side="left", fill="both", expand=True, padx=(0, 3))
+        binder_panel = ttk.LabelFrame(
+            groups, text="Assets and Virtual Binders", style="Glass.TLabelframe", padding=(14, 10)
+        )
+        binder_panel.pack(side="left", fill="both", expand=True, padx=(3, 0))
         self.settings_vars = {}
-        for row, definition in enumerate(SETTING_DEFINITIONS, start=1):
-            ttk.Label(panel, text=definition["label"], style="Field.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+        processing_keys = {"scan_incoming", "scan_processed", "scan_approved", "scan_exceptions", "scan_review"}
+        group_rows = {"processing": 0, "binder": 0}
+        for definition in SETTING_DEFINITIONS:
+            group_name = "processing" if definition["key"] in processing_keys else "binder"
+            panel = processing_panel if group_name == "processing" else binder_panel
+            row = group_rows[group_name]
             variable = tk.StringVar(value=str(self.config.get(definition["key"], "")))
             self.settings_vars[definition["key"]] = variable
-            ttk.Entry(panel, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=5)
+            ttk.Label(panel, text=definition["label"], style="Field.TLabel").grid(
+                row=row * 2, column=0, columnspan=2, sticky="w", pady=(3, 2)
+            )
+            ttk.Entry(panel, textvariable=variable).grid(row=row * 2 + 1, column=0, sticky="ew", pady=(0, 7))
             ttk.Button(
                 panel,
                 text="Browse…",
                 command=lambda item=definition: self._browse_setting(item),
-            ).grid(row=row, column=2, padx=(8, 0), pady=5)
-        panel.columnconfigure(1, weight=1)
-        ttk.Button(panel, text="Save Settings", command=self._save_settings, style="Primary.TButton").grid(
-            row=len(SETTING_DEFINITIONS) + 1, column=2, sticky="e", pady=(14, 0)
-        )
+            ).grid(row=row * 2 + 1, column=1, padx=(8, 0), pady=(0, 7))
+            group_rows[group_name] += 1
+        processing_panel.columnconfigure(0, weight=1)
+        binder_panel.columnconfigure(0, weight=1)
+        settings_footer = ttk.Frame(self.settings_tab, style="Navigation.TFrame", padding=(10, 6))
+        settings_footer.pack(side="bottom", fill="x", padx=12, pady=(0, 8), before=groups)
         self.settings_status_var = tk.StringVar(value="Settings are stored locally in config.json and are not published.")
-        ttk.Label(panel, textvariable=self.settings_status_var, style="Status.TLabel", anchor="w").grid(
-            row=len(SETTING_DEFINITIONS) + 2, column=0, columnspan=3, sticky="ew", pady=(14, 0)
+        ttk.Label(settings_footer, textvariable=self.settings_status_var, style="Navigation.TLabel", anchor="w").pack(
+            side="left", fill="x", expand=True
         )
+        ttk.Button(settings_footer, text="Save Settings", command=self._save_settings, style="Primary.TButton").pack(side="right")
 
     def _browse_setting(self, definition: dict) -> None:
         current = self.settings_vars[definition["key"]].get()
@@ -1076,9 +859,9 @@ class DotReviewApp:
 
     def _build_binder_tab(self) -> None:
         pane = ttk.Panedwindow(self.binder_tab, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=12, pady=12)
-        shelf = ttk.LabelFrame(pane, text="Digital Binder Shelf", style="Glass.TLabelframe", padding=(8, 8))
-        viewer = ttk.LabelFrame(pane, text="Binder Viewer", style="Glass.TLabelframe", padding=(10, 10))
+        pane.pack(fill="both", expand=True, padx=12, pady=(10, 8))
+        shelf = ttk.LabelFrame(pane, text="Asset Binders", style="Glass.TLabelframe", padding=(8, 8))
+        viewer = ttk.LabelFrame(pane, text="Document Viewer", style="Glass.TLabelframe", padding=(10, 10))
         pane.add(shelf, weight=1)
         pane.add(viewer, weight=4)
         shelf_toolbar = ttk.Frame(shelf, style="GlassContent.TFrame")
@@ -1180,18 +963,18 @@ class DotReviewApp:
         self.binder_records = [record for record in all_records if query in record["unit"].casefold()]
         y = 12
         for index, binder in enumerate(self.binder_records):
-            fill = "#123D6A" if binder["available"] else "#263241"
-            outline = DARK_THEME["accent"] if binder["available"] else DARK_THEME["muted"]
+            fill = DARK_THEME["raised"] if binder["available"] else DARK_THEME["surface"]
+            outline = DARK_THEME["border"]
+            accent = DARK_THEME["teal"] if binder["available"] else DARK_THEME["muted"]
             tag = f"binder-{index}"
-            self.binder_shelf.create_rectangle(12, y, 210, y + 46, fill=fill, outline=outline, width=2, tags=("binder", tag))
-            self.binder_shelf.create_line(20, y + 7, 202, y + 7, fill=outline, width=2, tags=("binder", tag))
-            self.binder_shelf.create_line(20, y + 39, 202, y + 39, fill=outline, width=2, tags=("binder", tag))
+            self.binder_shelf.create_rectangle(12, y, 210, y + 42, fill=fill, outline=outline, width=1, tags=("binder", tag))
+            self.binder_shelf.create_rectangle(12, y, 16, y + 42, fill=accent, outline=accent, tags=("binder", tag))
             suffix = "" if binder["available"] else "  •  folder missing"
             self.binder_shelf.create_text(
-                28, y + 23, anchor="w", text=f"UNIT {binder['unit']}{suffix}",
+                26, y + 21, anchor="w", text=f"UNIT {binder['unit']}{suffix}",
                 fill=DARK_THEME["text"], font=("Segoe UI", 10, "bold"), tags=("binder", tag),
             )
-            y += 56
+            y += 50
         self.binder_shelf.configure(scrollregion=(0, 0, 225, max(y, 1)))
         available = sum(1 for record in all_records if record["available"])
         visible = f"{len(self.binder_records)} shown • " if query else ""
@@ -1832,9 +1615,13 @@ class DotReviewApp:
         return next((item for item in self.model.results if item.get("source_file") == source), None)
 
     def _on_selection(self, _event=None) -> None:
+        selected_count = len(self.table.selection())
+        self.selection_count_var.set(f"{selected_count} selected")
         result = self._selected_result()
         if not result:
+            self._set_review_action_state(False)
             return
+        self._set_review_action_state(True)
         self.unit_var.set(result.get("unit") or "")
         self.type_var.set(self._document_type_label(result.get("document_type")))
         self.date_var.set(self._display_date(result.get("controlling_date")))
@@ -1850,6 +1637,11 @@ class DotReviewApp:
             )
         self.reason_var.set(review_notes or "No unresolved issues.")
         self.destination_var.set(result.get("proposed_destination") or "Not available until all fields are valid.")
+        self.source_filename_var.set(Path(result.get("source_file") or "").name or "—")
+        self.proposed_filename_var.set(result.get("proposed_filename") or "Not available until all fields are valid.")
+        status = self._humanize_user_text(result.get("status") or "unknown")
+        owner = result.get("asset_owner") or "Owner not identified"
+        self.owner_status_var.set(f"{status}  •  {owner}")
         self.sort_page_index = 0
         self._render_selected_sort_page()
 
@@ -1987,6 +1779,11 @@ class DotReviewApp:
         self.reason_var.set("No document selected.")
         filter_name = self.filter_var.get()
         self.destination_var.set(f"Select a {filter_name} document to review.")
+        self.source_filename_var.set("—")
+        self.proposed_filename_var.set("—")
+        self.owner_status_var.set("No document selected")
+        self.selection_count_var.set("0 selected")
+        self._set_review_action_state(False)
         self.sort_preview_generation += 1
         self.sort_page_index = 0
         self.sort_page_count = 0
