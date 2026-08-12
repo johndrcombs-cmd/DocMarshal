@@ -11,10 +11,12 @@ DESTINATION_SUBFOLDERS = {
     "REG": "003_Registration",
     "TITLE": "003_Registration",
     "CERTORIGIN": "003_Registration",
+    "CAB": "003_Registration",
     "RP": "004_Maintenance_Records",
+    "MISC": "005_Misc",
 }
 
-DOCUMENT_TYPE_CHOICES = ("DOT", "RP", "REG", "TITLE", "CERTORIGIN", "INS")
+DOCUMENT_TYPE_CHOICES = ("DOT", "RP", "REG", "TITLE", "CERTORIGIN", "CAB", "INS", "MISC")
 STANDARD_SUBFOLDERS = tuple(dict.fromkeys(DESTINATION_SUBFOLDERS.values()))
 
 

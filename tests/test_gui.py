@@ -1,4 +1,5 @@
 from pathlib import Path
+import queue
 
 from dotdocs import gui
 
@@ -21,6 +22,21 @@ class _Model:
 
     def replace(self, result):
         self.replaced = result
+        source = result.get("source_file")
+        for index, existing in enumerate(self.results):
+            if existing.get("source_file") == source:
+                self.results[index] = result
+                return
+        self.results.append(result)
+
+    def filtered(self, filter_name):
+        if filter_name == "Active":
+            return [
+                item
+                for item in self.results
+                if item.get("status") in {"ready_for_review", "needs_review", "failed"}
+            ]
+        return list(self.results)
 
 
 class _Widget:
@@ -31,6 +47,21 @@ class _Widget:
         self.bindings[sequence] = callback
 
 
+class _SelectionTable:
+    def __init__(self, children, selected=()):
+        self.children = tuple(children)
+        self.selected = tuple(selected)
+
+    def get_children(self):
+        return self.children
+
+    def selection(self):
+        return self.selected
+
+    def selection_set(self, items):
+        self.selected = tuple(items)
+
+
 def test_document_type_choices_include_distinct_registration_documents():
     assert gui.DOCUMENT_TYPE_CHOICES == (
         "DOT",
@@ -38,8 +69,12 @@ def test_document_type_choices_include_distinct_registration_documents():
         "REG",
         "TITLE",
         "CERTORIGIN",
+        "CAB",
         "INS",
+        "MISC",
     )
+    assert gui.DOCUMENT_TYPE_LABELS["MISC"] == "Misc"
+    assert gui.DOCUMENT_TYPE_LABELS["CAB"] == "CAB Card"
 
 
 def test_fixed_dark_theme_declares_complete_glass_palette():
@@ -85,11 +120,148 @@ def test_sort_and_virtual_binder_expose_import_ocr_zoom_and_sequence_controls():
     assert 'text="Import PDFs"' in source
     assert 'text="Run OCR on Selected"' in source
     assert 'text="Run OCR on All Needing OCR"' in source
+    assert "NON_DOT_DOCUMENT_TYPES" in source
+    assert 'text="Classify and Archive"' in source
+    assert "classification=classification" in source
+    assert "non_dot_classification_label" in source
     assert 'text="Zoom Out"' in source
     assert 'text="Fit Page"' in source
     assert 'text="Zoom In"' in source
     assert "binder_page_canvas" in source
     assert "advance_binder_position" in source
+    assert "sort_page_canvas" in source
+    assert "_render_selected_sort_page" in source
+    assert 'text="‹ Previous"' in source
+    assert 'text="Next ›"' in source
+    assert 'text="Rotate Preview"' in source
+    assert 'text="Left"' in source
+    assert 'text="Right"' in source
+    assert 'text="Select All Visible"' in source
+    assert 'selectmode="extended"' in source
+
+
+def test_select_all_visible_selects_every_displayed_queue_row():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.table = _SelectionTable(("row-0", "row-1", "row-2"))
+
+    app.select_all_visible()
+
+    assert app.table.selection() == ("row-0", "row-1", "row-2")
+
+
+def test_selected_results_follow_visible_row_order():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.table = _SelectionTable(("row-0", "row-1", "row-2"), ("row-2", "row-0"))
+    app.row_sources = {"row-0": "a.pdf", "row-1": "b.pdf", "row-2": "c.pdf"}
+    app.model = gui.ReviewModel([
+        {"source_file": "a.pdf", "status": "needs_review"},
+        {"source_file": "b.pdf", "status": "needs_review"},
+        {"source_file": "c.pdf", "status": "needs_review"},
+    ])
+
+    assert [item["source_file"] for item in app._selected_results()] == ["a.pdf", "c.pdf"]
+
+
+def test_bulk_not_dot_worker_continues_after_failure_and_saves_each_success(monkeypatch, tmp_path):
+    candidates = [
+        {"source_file": "a.pdf", "status": "needs_review"},
+        {"source_file": "b.pdf", "status": "needs_review"},
+        {"source_file": "c.pdf", "status": "needs_review"},
+    ]
+    archived = []
+    saved = []
+
+    def mark(result, **kwargs):
+        if result["source_file"] == "b.pdf":
+            raise gui.ReviewValidationError("fingerprint mismatch")
+        updated = dict(result, status="not_dot", non_dot_classification_label="Other / Unclassified")
+        archived.append((result["source_file"], kwargs["classification"]))
+        return updated
+
+    monkeypatch.setattr(gui, "mark_not_dot_document", mark)
+    monkeypatch.setattr(
+        gui,
+        "save_review_session",
+        lambda path, results: saved.append((path, [dict(item) for item in results])),
+    )
+
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.events = queue.Queue()
+    app.audit_path = tmp_path / "audit.jsonl"
+    app.incoming = tmp_path / "Incoming"
+    app.exceptions = tmp_path / "Exceptions"
+    app.session_path = tmp_path / "active_review.json"
+
+    app._bulk_not_dot_worker(candidates, "OTHER", [dict(item) for item in candidates])
+
+    events = [app.events.get_nowait() for _ in range(4)]
+    assert archived == [("a.pdf", "OTHER"), ("c.pdf", "OTHER")]
+    assert len(saved) == 2
+    assert [event[0] for event in events] == [
+        "bulk_not_dot_progress",
+        "bulk_not_dot_progress",
+        "bulk_not_dot_progress",
+        "bulk_not_dot_done",
+    ]
+    assert events[-1][1]["completed"] == 2
+    assert events[-1][1]["failed"] == 1
+    assert events[-1][1]["errors"] == [{"filename": "b.pdf", "error": "fingerprint mismatch"}]
+
+
+def test_rotate_sort_page_remembers_quarter_turn_for_selected_page():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.sort_page_rotations = {}
+    app.sort_page_index = 2
+    app._selected_source = lambda: "scan.pdf"
+    calls = []
+    app._render_selected_sort_page = lambda: calls.append("render")
+
+    app._rotate_sort_page(90)
+    app._rotate_sort_page(90)
+    app._rotate_sort_page(-90)
+
+    assert app.sort_page_rotations[("scan.pdf", 2)] == 90
+    assert calls == ["render", "render", "render"]
+
+
+def test_next_active_source_follows_prior_queue_order_and_wraps():
+    choose = gui.next_active_source
+
+    assert choose(("a.pdf", "b.pdf", "c.pdf"), "b.pdf", ("a.pdf", "c.pdf")) == "c.pdf"
+    assert choose(("a.pdf", "b.pdf", "c.pdf"), "c.pdf", ("a.pdf", "b.pdf")) == "a.pdf"
+    assert choose(("a.pdf",), "a.pdf", ()) is None
+    assert choose(("a.pdf", "b.pdf"), "missing.pdf", ("a.pdf", "b.pdf")) == "a.pdf"
+
+
+def test_refresh_and_select_next_preserves_ready_filter_and_selects_next_ready_source():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.filter_var = _Value("Ready")
+    app.model = gui.ReviewModel([
+        {"source_file": "a.pdf", "status": "approved"},
+        {"source_file": "b.pdf", "status": "ready_for_review"},
+        {"source_file": "c.pdf", "status": "needs_review"},
+    ])
+    calls = []
+    app._refresh = lambda: calls.append("refresh")
+    app._select_source = lambda source: calls.append(("select", source))
+    app._clear_sort_selection = lambda: calls.append("clear")
+
+    app._refresh_and_select_next(("a.pdf", "b.pdf"), "a.pdf")
+
+    assert app.filter_var.value == "Ready"
+    assert calls == ["refresh", ("select", "b.pdf")]
+
+    app.model.results[1]["status"] = "approved"
+    calls.clear()
+    app._refresh_and_select_next(("b.pdf",), "b.pdf")
+
+    assert app.filter_var.value == "Ready"
+    assert calls == ["refresh", "clear"]
+
+
+def test_empty_queue_message_names_the_preserved_filter():
+    assert gui.DotReviewApp._empty_queue_message("Ready") == "No Ready documents remain in the queue."
+    assert gui.DotReviewApp._empty_queue_message("Active") == "No Active documents remain in the queue."
 
 
 def test_humanizes_internal_codes_for_user_facing_text():
@@ -187,9 +359,13 @@ def test_approval_applies_current_fields_and_files_in_one_click_without_popups(
     app.incoming = source.parent
     app.session_path = tmp_path / "active_review.json"
     app.model = _Model()
+    app.model.results = [result]
     app.status_var = _Value()
-    app._refresh = lambda: None
-    app._select_source = lambda source_file: None
+    app.filter_var = _Value("All")
+    advanced = []
+    app._refresh_and_select_next = lambda prior, source_file: (
+        app.filter_var.set("Active"), advanced.append((prior, source_file))
+    )
 
     app.approve_selected()
 
@@ -200,6 +376,7 @@ def test_approval_applies_current_fields_and_files_in_one_click_without_popups(
     assert correction_audits
     assert app.model.replaced == approved
     assert app.status_var.value == "Approved and copied: 91_RP_07-07-2026_PG2.pdf"
+    assert advanced == [((str(source),), str(source))]
 
 
 def test_mark_duplicate_archives_and_hides_selected_document_from_active_view(monkeypatch, tmp_path):
@@ -234,7 +411,10 @@ def test_mark_duplicate_archives_and_hides_selected_document_from_active_view(mo
     app.model.results = [result]
     app.status_var = _Value()
     app.filter_var = _Value("All")
-    app._refresh = lambda: None
+    advanced = []
+    app._refresh_and_select_next = lambda prior, source_file: (
+        app.filter_var.set("Active"), advanced.append((prior, source_file))
+    )
 
     app.mark_selected_duplicate()
 
@@ -243,6 +423,7 @@ def test_mark_duplicate_archives_and_hides_selected_document_from_active_view(mo
     assert saved
     assert app.filter_var.value == "Active"
     assert app.status_var.value == "Marked duplicate and archived: duplicate.pdf"
+    assert advanced == [((str(source),), str(source))]
 
 
 def test_mark_not_dot_archives_and_hides_selected_document_from_active_view(monkeypatch, tmp_path):
@@ -251,15 +432,15 @@ def test_mark_not_dot_archives_and_hides_selected_document_from_active_view(monk
     source.write_bytes(b"pdf")
     result = {"source_file": str(source), "status": "needs_review"}
     archived_path = tmp_path / "Exceptions" / "Not DOT" / source.name
-    marked = dict(result, status="not_dot", not_dot_archived_file=str(archived_path))
-    confirmations = []
+    marked = dict(
+        result,
+        status="not_dot",
+        not_dot_archived_file=str(archived_path),
+        non_dot_classification="MVR_AUTH",
+        non_dot_classification_label="MVR Auth",
+    )
     calls = []
     saved = []
-    monkeypatch.setattr(
-        gui.messagebox,
-        "askyesno",
-        lambda *args, **kwargs: confirmations.append((args, kwargs)) or True,
-    )
     monkeypatch.setattr(
         gui,
         "mark_not_dot_document",
@@ -273,6 +454,8 @@ def test_mark_not_dot_archives_and_hides_selected_document_from_active_view(monk
 
     app = gui.DotReviewApp.__new__(gui.DotReviewApp)
     app._selected_result = lambda: result
+    app._selected_results = lambda: [result]
+    app._choose_non_dot_classification = lambda _source_name: "MVR_AUTH"
     app.audit_path = tmp_path / "Review" / "audit.jsonl"
     app.incoming = source.parent
     app.exceptions = tmp_path / "Exceptions"
@@ -281,16 +464,18 @@ def test_mark_not_dot_archives_and_hides_selected_document_from_active_view(monk
     app.model.results = [result]
     app.status_var = _Value()
     app.filter_var = _Value("All")
-    app._refresh = lambda: None
+    advanced = []
+    app._refresh_and_select_next = lambda prior, source_file: advanced.append((prior, source_file))
 
     app.mark_selected_not_dot()
 
-    assert len(confirmations) == 1
+    assert calls[0][1]["classification"] == "MVR_AUTH"
     assert calls[0][1]["exceptions_folder"] == app.exceptions
     assert app.model.replaced == marked
     assert saved
-    assert app.filter_var.value == "Active"
-    assert app.status_var.value == "Removed from DOT workflow: unrelated.pdf"
+    assert app.filter_var.value == "All"
+    assert app.status_var.value == "Classified as MVR Auth and removed from DOT workflow: unrelated.pdf"
+    assert advanced == [((str(source),), str(source))]
 
 
 def test_open_pdf_opens_archived_not_dot_document(monkeypatch, tmp_path):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
 
@@ -11,6 +11,28 @@ from .normalization import normalize_plate, normalize_unit, normalize_vin
 
 def _sort_units(units):
     return sorted(units, key=lambda value: (len(value), value))
+
+
+GENERIC_MODELS = {
+    "DUMP",
+    "FARM",
+    "FLATBED",
+    "MODEL",
+    "PICKUP",
+    "SEMI",
+    "TRAILER",
+    "TRUCK",
+}
+
+
+def _description_pattern(value: object) -> str | None:
+    words = re.findall(r"[A-Z0-9]+", str(value or "").upper())
+    normalized = " ".join(words)
+    if not words or normalized in GENERIC_MODELS:
+        return None
+    return r"(?<![A-Z0-9])" + r"[^A-Z0-9]{0,3}".join(
+        re.escape(word) for word in words
+    ) + r"(?![A-Z0-9])"
 
 
 def match_units_in_text(database_path: str | Path, text: str) -> dict:
@@ -29,12 +51,13 @@ def match_units_in_text(database_path: str | Path, text: str) -> dict:
 
     with closing(sqlite3.connect(database_path)) as connection:
         records = connection.execute(
-            "SELECT normalized_unit, plate, vin FROM units WHERE normalized_unit <> ''"
+            "SELECT normalized_unit, plate, vin, year, make, model FROM units WHERE normalized_unit <> ''"
         ).fetchall()
 
     known_units = {record[0] for record in records}
+    unit_record_counts = Counter(record[0] for record in records)
 
-    for unit, plate, vin in records:
+    for unit, plate, vin, _year, _make, _model in records:
         normalized_vin = normalize_vin(vin)
         if normalized_vin and len(normalized_vin) >= 11 and normalized_vin in compact_text:
             evidence[unit].add(f"VIN:{vin}")
@@ -91,6 +114,49 @@ def match_units_in_text(database_path: str | Path, text: str) -> dict:
                 unit = normalize_unit(match.group(1))
                 if unit in known_units:
                     evidence[unit].add(f"UNIT:{unit}")
+
+    if not evidence and re.search(r"\b(?:INVOICE|REPAIR ORDER|WORK ORDER)\b", raw_text, flags=re.IGNORECASE):
+        has_unit_column = re.search(
+            r"\bUNIT\s*(?:NO\.?|NUMBER|#)\b",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        vehicle_row_candidates = set()
+        if has_unit_column:
+            for unit, _plate, _vin, year, make, model in records:
+                if unit_record_counts[unit] != 1:
+                    continue
+                model_pattern = _description_pattern(model)
+                if not model_pattern:
+                    continue
+                make_pattern = _description_pattern(make)
+                unit_pattern = (
+                    rf"(?<![A-Z0-9.])0*{re.escape(unit)}(?![A-Z0-9.])"
+                )
+                for model_match in re.finditer(
+                    model_pattern,
+                    raw_text,
+                    flags=re.IGNORECASE,
+                ):
+                    row_prefix = raw_text[max(0, model_match.start() - 80) : model_match.start()]
+                    row_suffix = raw_text[model_match.end() : model_match.end() + 50]
+                    year_present = bool(
+                        year and re.search(rf"\b{re.escape(str(year))}\b", row_prefix)
+                    )
+                    make_present = bool(
+                        make_pattern
+                        and re.search(make_pattern, row_prefix, flags=re.IGNORECASE)
+                    )
+                    if (year_present or make_present) and re.search(
+                        unit_pattern,
+                        row_suffix,
+                        flags=re.IGNORECASE,
+                    ):
+                        vehicle_row_candidates.add(unit)
+                        break
+        if len(vehicle_row_candidates) == 1:
+            unit = next(iter(vehicle_row_candidates))
+            evidence[unit].add(f"VEHICLE_ROW:{unit}")
 
     units = _sort_units(evidence)
     if not units:

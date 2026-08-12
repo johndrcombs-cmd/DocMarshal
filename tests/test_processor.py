@@ -48,6 +48,26 @@ def test_analyzes_searchable_registration_without_moving_it(tmp_path):
     assert not (destination / "97_REG_03-31-2026.pdf").exists()
 
 
+def test_analyzes_searchable_semi_cab_card_as_distinct_registration_document(tmp_path):
+    database = _database(tmp_path)
+    unit_root = tmp_path / "In Use"
+    destination = unit_root / "Unit_97" / "003_Registration"
+    destination.mkdir(parents=True)
+    pdf = tmp_path / "cab-card.pdf"
+    _searchable_pdf(
+        pdf,
+        "OKLAHOMA APPORTIONED CAB CARD VIN 1GB3KZBK9AF141680 Registration Expires 6/30/2026",
+    )
+
+    result = analyze_pdf(pdf, database, unit_root)
+
+    assert result["status"] == "ready_for_review"
+    assert result["document_type"] == "CAB"
+    assert result["controlling_date"] == "2026-06-30"
+    assert result["proposed_filename"] == "97_CAB_06-30-2026.pdf"
+    assert result["proposed_destination"] == str(destination / "97_CAB_06-30-2026.pdf")
+
+
 def test_routes_image_only_pdf_to_review_without_guessing(tmp_path):
     database = _database(tmp_path)
     pdf = tmp_path / "image-only.pdf"

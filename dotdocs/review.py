@@ -17,6 +17,12 @@ from .processor import find_unit_folder
 
 ALLOWED_DOCUMENT_TYPES = set(DOCUMENT_TYPE_CHOICES)
 DOCUMENT_TYPE_ERROR = "Choose a valid document type: " + ", ".join(DOCUMENT_TYPE_CHOICES) + "."
+NON_DOT_DOCUMENT_TYPES = {
+    "MVR_AUTH": "MVR Auth",
+    "CALIBRATION_CERT": "Calibration Certificate",
+    "TRAINING_DOC": "Training Document",
+    "OTHER": "Other / Unclassified",
+}
 
 
 class ReviewValidationError(ValueError):
@@ -209,10 +215,15 @@ def record_asset_created(audit_path: str | Path, asset: dict) -> None:
 def mark_not_dot_document(
     result: dict,
     *,
+    classification: str,
     audit_path: str | Path,
     incoming_folder: str | Path,
     exceptions_folder: str | Path,
 ) -> dict:
+    classification_code = str(classification or "").strip().upper()
+    if classification_code not in NON_DOT_DOCUMENT_TYPES:
+        raise ReviewValidationError("Choose a valid Not DOT document classification before archiving.")
+    classification_label = NON_DOT_DOCUMENT_TYPES[classification_code]
     source = Path(result.get("source_file") or "")
     incoming_folder = Path(incoming_folder).resolve()
     if not source.is_file() or source.suffix.lower() != ".pdf":
@@ -254,6 +265,8 @@ def mark_not_dot_document(
     started_entry = {
         "source_file": str(source),
         "archived_file": str(archive),
+        "non_dot_classification": classification_code,
+        "non_dot_classification_label": classification_label,
         "source_sha256": expected_hash,
         "source_size": expected_size,
     }
@@ -299,6 +312,8 @@ def mark_not_dot_document(
             "proposed_filename": None,
             "proposed_destination": None,
             "not_dot_archived_file": str(archive),
+            "non_dot_classification": classification_code,
+            "non_dot_classification_label": classification_label,
             "not_dot_at_utc": datetime.now(timezone.utc).isoformat(),
         }
     )

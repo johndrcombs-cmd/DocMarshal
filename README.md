@@ -11,10 +11,18 @@
 ## Features
 
 - Modern dark interface with navy, blue, and marshal-gold branding
+- Four workspaces: **Sort**, **Database**, **Settings**, and **Virtual Binder**
 - Searchable-PDF analysis with conservative, fail-closed field extraction
 - Human-readable review notes and document names
 - Explicit **Approve and File Copy** workflow
 - Unit, document-type, controlling-date, and continuation-page correction
+- Embedded read-only Sort viewer with paging, zoom, Fit, and per-page 90° preview rotation
+- Filter-aware next-document selection that preserves the selected review category
+- Ctrl/Shift multi-selection and **Select All Visible** for scoped bulk actions
+- Classified Not DOT dispositions with exact-count confirmation and per-file failure isolation
+- Copy-only PDF import and selected/bulk OCR with verified original backups
+- SQLite-backed asset management and transactional workbook import/export
+- Read-only Virtual Binder navigation across canonical document categories
 - Collision protection—existing destination files are never overwritten
 - SHA-256 source verification for filing and archive operations
 - Duplicate and Not DOT archives with audited Restore to Active
@@ -67,7 +75,9 @@ Python dependencies are pinned in `requirements.txt`.
 - Registration: `{UNIT}_REG_{MM-DD-YYYY}.pdf`
 - Title: `{UNIT}_TITLE_{MM-DD-YYYY}.pdf`
 - Certificate of origin: `{UNIT}_CERTORIGIN_{MM-DD-YYYY}.pdf`
+- CAB Card: `{UNIT}_CAB_{MM-DD-YYYY}.pdf`
 - Insurance: `{UNIT}_INS_{MM-DD-YYYY}.pdf`
+- Miscellaneous supported record: `{UNIT}_MISC_{MM-DD-YYYY}.pdf`
 
 Continuation pages use `_PG2`, `_PG3`, and later suffixes immediately before `.pdf`.
 

@@ -70,6 +70,7 @@ def test_register_manual_asset_persists_owner_database_and_standard_folders(tmp_
         "002_Insurance",
         "003_Registration",
         "004_Maintenance_Records",
+        "005_Misc",
     ]
     audit_records = [
         json.loads(line)

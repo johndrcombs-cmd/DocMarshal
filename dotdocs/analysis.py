@@ -6,7 +6,8 @@ from datetime import date, datetime
 
 CLASSIFICATION_RULES = (
     ("DOT", ("ANNUAL VEHICLE INSPECTION",)),
-    ("INS", ("SECURITY VERIFICATION FORM", "INSURANCE")),
+    ("INS", ("SECURITY VERIFICATION FORM",)),
+    ("CAB", ("APPORTIONED CAB CARD", "CAB CARD")),
     ("REG", ("CERTIFICATE OF REGISTRATION", "REGISTRATION CERTIFICATE")),
     ("TITLE", ("CERTIFICATE OF TITLE", "VEHICLE TITLE")),
     (
@@ -28,6 +29,7 @@ DATE_LABELS = {
     "DOT": (r"\bDATE\b", r"INSPECTION\s+DATE"),
     "RP": (r"INVOICE\s+DATE", r"SERVICE\s+DATE", r"\bDATE\b"),
     "REG": (r"REG(?:ISTRATION)?\s+EXPIRES", r"EXPIRATION\s+DATE"),
+    "CAB": (r"REG(?:ISTRATION)?\s+EXPIRES", r"EXPIRATION\s+DATE", r"EXPIRES"),
     "INS": (r"EXPIRATION\s+DATE", r"POLICY\s+EXPIRES"),
     "TITLE": (r"TITLE\s+DATE", r"ISSUE\s+DATE", r"DATE\s+ISSUED"),
     "CERTORIGIN": (r"DATE\s+ISSUED", r"ISSUE\s+DATE"),
@@ -40,6 +42,21 @@ def _collapsed(text: str) -> str:
 
 def classify_document(text: str) -> str | None:
     normalized = _collapsed(text)
+    if all(
+        keyword in normalized
+        for keyword in (
+            "ODOMETER DISCLOSURE STATEMENT",
+            "TRANSFEROR",
+            "TRANSFEREE",
+        )
+    ):
+        return "MISC"
+    if (
+        re.search(r"\bVEHICLE\s+BUYER\W*S\s+ORDER\b", normalized)
+        and "PRICE OF VEHICLE" in normalized
+        and "TOTAL DELIVERED PRICE" in normalized
+    ):
+        return "MISC"
     if (
         "VEHICLE IDENTIFICATION" in normalized
         and re.search(r"\bTIT?LE\s*NO\b", normalized)
@@ -97,7 +114,7 @@ def extract_controlling_date(text: str, document_type: str) -> date | None:
             values = re.findall(DATE_TOKEN, table.group(1))
             if len(values) >= 2:
                 return _parse_date(values[1])
-    if normalized_type == "REG":
+    if normalized_type in {"REG", "CAB"}:
         vehicle_row = re.search(DATE_TOKEN + r"\s+" + DATE_TOKEN, normalized_text)
         if vehicle_row:
             return _parse_date(vehicle_row.group(2))

@@ -9,6 +9,7 @@ import dotdocs.assets as assets
 import dotdocs.review as review_module
 from dotdocs.database import import_fleet_workbook
 from dotdocs.review import (
+    NON_DOT_DOCUMENT_TYPES,
     ApprovalError,
     ReviewValidationError,
     apply_correction,
@@ -149,6 +150,7 @@ def test_apply_correction_rejects_invalid_additional_page_suffix(tmp_path, page_
     [
         ("TITLE", "91_TITLE_04-15-2026.pdf"),
         ("CERTORIGIN", "91_CERTORIGIN_04-15-2026.pdf"),
+        ("CAB", "91_CAB_04-15-2026.pdf"),
     ],
 )
 def test_registration_family_types_keep_distinct_filenames(
@@ -165,6 +167,24 @@ def test_registration_family_types_keep_distinct_filenames(
     assert corrected["document_type"] == document_type
     assert corrected["proposed_filename"] == expected_filename
     assert Path(corrected["proposed_destination"]).parent.name == "003_Registration"
+
+
+def test_misc_correction_routes_to_canonical_misc_folder(tmp_path):
+    unit_root = _unit_root(tmp_path)
+    misc_folder = unit_root / "Unit_91" / "005_Misc"
+    misc_folder.mkdir()
+
+    corrected = apply_correction(
+        _result(tmp_path),
+        unit="91",
+        document_type="MISC",
+        controlling_date="08/11/2026",
+        unit_folders_root=unit_root,
+    )
+
+    assert corrected["document_type"] == "MISC"
+    assert corrected["proposed_filename"] == "91_MISC_08-11-2026.pdf"
+    assert Path(corrected["proposed_destination"]).parent == misc_folder
 
 
 def test_apply_correction_creates_standard_folder_for_verified_existing_unit(tmp_path):
@@ -190,6 +210,7 @@ def test_apply_correction_creates_standard_folder_for_verified_existing_unit(tmp
         "002_Insurance",
         "003_Registration",
         "004_Maintenance_Records",
+        "005_Misc",
     ]
     events = [json.loads(line)["event"] for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert events == ["unit_folder_creation_started", "unit_folder_created"]
@@ -358,6 +379,7 @@ def test_mark_not_dot_moves_pdf_to_exceptions_and_audits_action(tmp_path):
 
     not_dot = mark_not_dot_document(
         result,
+        classification="MVR_AUTH",
         audit_path=audit_path,
         incoming_folder=Path(result["source_file"]).parent,
         exceptions_folder=tmp_path / "Exceptions",
@@ -366,6 +388,8 @@ def test_mark_not_dot_moves_pdf_to_exceptions_and_audits_action(tmp_path):
     archive = tmp_path / "Exceptions" / "Not DOT" / "scan.pdf"
     assert not_dot["status"] == "not_dot"
     assert not_dot["reasons"] == ["REMOVED_FROM_DOT_WORKFLOW"]
+    assert not_dot["non_dot_classification"] == "MVR_AUTH"
+    assert not_dot["non_dot_classification_label"] == "MVR Auth"
     assert not_dot["not_dot_archived_file"] == str(archive)
     assert not_dot["proposed_filename"] is None
     assert not_dot["proposed_destination"] is None
@@ -373,6 +397,32 @@ def test_mark_not_dot_moves_pdf_to_exceptions_and_audits_action(tmp_path):
     assert not Path(result["source_file"]).exists()
     entries = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert [entry["event"] for entry in entries] == ["not_dot_mark_started", "marked_not_dot"]
+    assert all(entry["non_dot_classification"] == "MVR_AUTH" for entry in entries)
+
+
+def test_not_dot_classifications_are_stable_learning_labels():
+    assert NON_DOT_DOCUMENT_TYPES == {
+        "MVR_AUTH": "MVR Auth",
+        "CALIBRATION_CERT": "Calibration Certificate",
+        "TRAINING_DOC": "Training Document",
+        "OTHER": "Other / Unclassified",
+    }
+
+
+def test_mark_not_dot_requires_supported_classification_before_moving_source(tmp_path):
+    result = _result(tmp_path)
+
+    with pytest.raises(ReviewValidationError, match="classification"):
+        mark_not_dot_document(
+            result,
+            classification="",
+            audit_path=tmp_path / "Review" / "audit.jsonl",
+            incoming_folder=Path(result["source_file"]).parent,
+            exceptions_folder=tmp_path / "Exceptions",
+        )
+
+    assert Path(result["source_file"]).is_file()
+    assert not (tmp_path / "Exceptions").exists()
 
 
 def test_mark_not_dot_uses_numbered_archive_name_without_overwriting(tmp_path):
@@ -384,6 +434,7 @@ def test_mark_not_dot_uses_numbered_archive_name_without_overwriting(tmp_path):
 
     not_dot = mark_not_dot_document(
         result,
+        classification="OTHER",
         audit_path=tmp_path / "Review" / "audit.jsonl",
         incoming_folder=Path(result["source_file"]).parent,
         exceptions_folder=tmp_path / "Exceptions",
@@ -415,6 +466,7 @@ def test_restore_archived_document_moves_pdf_back_to_active_review(tmp_path, arc
     else:
         archived = mark_not_dot_document(
             result,
+            classification="TRAINING_DOC",
             audit_path=tmp_path / "Review" / "audit.jsonl",
             incoming_folder=Path(result["source_file"]).parent,
             exceptions_folder=tmp_path / "Exceptions",

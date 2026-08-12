@@ -18,6 +18,7 @@ from .binder import (
     list_binder_documents,
     list_binders,
     render_binder_page,
+    render_pdf_page,
 )
 from .database import (
     EDITABLE_UNIT_FIELDS,
@@ -39,6 +40,7 @@ from .naming import DOCUMENT_TYPE_CHOICES
 from .processor import analyze_pdf
 from .settings import SETTING_DEFINITIONS, save_user_settings
 from .review import (
+    NON_DOT_DOCUMENT_TYPES,
     ApprovalError,
     ReviewValidationError,
     apply_correction,
@@ -79,10 +81,27 @@ DOCUMENT_TYPE_LABELS = {
     "REG": "Registration",
     "TITLE": "Title",
     "CERTORIGIN": "Certificate of Origin",
+    "CAB": "CAB Card",
     "INS": "Insurance",
+    "MISC": "Misc",
 }
 
-DISPLAY_ACRONYMS = {"DOT", "PDF", "VIN", "OCR", "ID", "RP", "REG", "INS"}
+DISPLAY_ACRONYMS = {"DOT", "PDF", "VIN", "OCR", "ID", "RP", "REG", "INS", "MISC"}
+
+
+def next_active_source(
+    prior_order: tuple[str, ...],
+    completed_source: str,
+    remaining_order: tuple[str, ...],
+) -> str | None:
+    if not remaining_order:
+        return None
+    if completed_source not in prior_order:
+        return remaining_order[0]
+    completed_index = prior_order.index(completed_source)
+    candidates = prior_order[completed_index + 1 :] + prior_order[:completed_index]
+    remaining = set(remaining_order)
+    return next((source for source in candidates if source in remaining), remaining_order[0])
 
 
 class DotReviewApp:
@@ -106,6 +125,7 @@ class DotReviewApp:
         self.row_sources: dict[str, str] = {}
         self.scanning = False
         self.ocr_running = False
+        self.bulk_action_running = False
         self.session_load_error = None
 
         initial_results = []
@@ -496,13 +516,28 @@ class DotReviewApp:
         ttk.Button(toolbar, text="Add New Asset", command=self.add_new_asset).pack(side="left", padx=(14, 3))
         ttk.Button(toolbar, text="Restore Active", command=self.restore_selected).pack(side="left", padx=3)
 
-        pane = ttk.Panedwindow(self.sort_tab, orient="vertical")
-        pane.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        sort_workspace = ttk.Panedwindow(self.sort_tab, orient="horizontal")
+        sort_workspace.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        queue_workspace = ttk.Panedwindow(sort_workspace, orient="vertical")
+        sort_workspace.add(queue_workspace, weight=1)
 
-        table_frame = ttk.Frame(pane, style="Glass.TFrame", padding=1)
-        pane.add(table_frame, weight=1)
+        table_frame = ttk.Frame(queue_workspace, style="Glass.TFrame", padding=1)
+        queue_workspace.add(table_frame, weight=2)
+        selection_toolbar = ttk.Frame(table_frame, style="GlassContent.TFrame", padding=(8, 5))
+        selection_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.select_all_button = ttk.Button(
+            selection_toolbar,
+            text="Select All Visible",
+            command=self.select_all_visible,
+        )
+        self.select_all_button.pack(side="left")
+        ttk.Label(
+            selection_toolbar,
+            text="Use Ctrl or Shift to select multiple documents",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=(10, 0))
         columns = ("file", "status", "unit", "owner", "type", "date", "filename", "reason")
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
         headings = {
             "file": "Source File",
             "status": "Status",
@@ -513,7 +548,7 @@ class DotReviewApp:
             "filename": "Proposed Filename",
             "reason": "Review Notes",
         }
-        widths = {"file": 145, "status": 100, "unit": 60, "owner": 95, "type": 125, "date": 130, "filename": 190, "reason": 270}
+        widths = {"file": 105, "status": 80, "unit": 45, "owner": 65, "type": 95, "date": 90, "filename": 120, "reason": 140}
         for column in columns:
             self.table.heading(column, text=headings[column])
             self.table.column(
@@ -526,10 +561,10 @@ class DotReviewApp:
         vertical_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
         horizontal_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
         self.table.configure(yscrollcommand=vertical_scroll.set, xscrollcommand=horizontal_scroll.set)
-        self.table.grid(row=0, column=0, sticky="nsew")
-        vertical_scroll.grid(row=0, column=1, sticky="ns")
-        horizontal_scroll.grid(row=1, column=0, sticky="ew")
-        table_frame.rowconfigure(0, weight=1)
+        self.table.grid(row=1, column=0, sticky="nsew")
+        vertical_scroll.grid(row=1, column=1, sticky="ns")
+        horizontal_scroll.grid(row=2, column=0, sticky="ew")
+        table_frame.rowconfigure(1, weight=1)
         table_frame.columnconfigure(0, weight=1)
         self.table.bind("<<TreeviewSelect>>", self._on_selection)
         self.table.bind("<Double-1>", lambda _event: self.open_pdf())
@@ -541,12 +576,12 @@ class DotReviewApp:
         self.table.tag_configure("not_dot", background="#1B202A", foreground="#B8C2D1")
 
         review_panel = ttk.LabelFrame(
-            pane,
+            queue_workspace,
             text="Review Selected Document",
             style="Glass.TLabelframe",
             padding=(14, 12),
         )
-        pane.add(review_panel, weight=4)
+        queue_workspace.add(review_panel, weight=3)
         self.unit_var = tk.StringVar()
         self.type_var = tk.StringVar()
         self.date_var = tk.StringVar()
@@ -578,19 +613,29 @@ class DotReviewApp:
         ).grid(row=1, column=3, sticky="ew", padx=(0, 10))
         action_bar = ttk.Frame(review_panel, style="GlassContent.TFrame")
         action_bar.grid(row=2, column=0, columnspan=8, sticky="e", pady=(12, 2))
-        ttk.Button(action_bar, text="Save Correction", command=self.save_correction).pack(side="left", padx=(0, 8))
-        ttk.Button(
+        self.save_correction_button = ttk.Button(action_bar, text="Save Correction", command=self.save_correction)
+        self.save_correction_button.pack(side="left", padx=(0, 8))
+        self.approve_button = ttk.Button(
             action_bar,
             text="Approve and File Copy",
             command=self.approve_selected,
             style="Primary.TButton",
-        ).pack(side="left")
-        ttk.Button(action_bar, text="Mark Duplicate", command=self.mark_selected_duplicate, style="Warning.TButton").pack(
-            side="left", padx=(8, 0)
         )
-        ttk.Button(action_bar, text="Not a DOT Document", command=self.mark_selected_not_dot, style="Danger.TButton").pack(
-            side="left", padx=(8, 0)
+        self.approve_button.pack(side="left")
+        self.duplicate_button = ttk.Button(
+            action_bar,
+            text="Mark Duplicate",
+            command=self.mark_selected_duplicate,
+            style="Warning.TButton",
         )
+        self.duplicate_button.pack(side="left", padx=(8, 0))
+        self.not_dot_button = ttk.Button(
+            action_bar,
+            text="Not a DOT Document",
+            command=self.mark_selected_not_dot,
+            style="Danger.TButton",
+        )
+        self.not_dot_button.pack(side="left", padx=(8, 0))
         ttk.Label(review_panel, text="Review Notes", style="Field.TLabel").grid(row=3, column=0, sticky="nw", pady=(8, 0))
         ttk.Label(review_panel, textvariable=self.reason_var, wraplength=1100, style="Glass.TLabel").grid(
             row=3, column=1, columnspan=7, sticky="w", pady=(8, 0)
@@ -601,9 +646,67 @@ class DotReviewApp:
         )
         review_panel.columnconfigure(2, weight=1)
 
+        viewer = ttk.LabelFrame(
+            sort_workspace,
+            text="Document Viewer",
+            style="Glass.TLabelframe",
+            padding=(10, 8),
+        )
+        sort_workspace.add(viewer, weight=1)
+        viewer_toolbar = ttk.Frame(viewer, style="GlassContent.TFrame")
+        viewer_toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Button(viewer_toolbar, text="−", width=3, command=lambda: self._change_sort_zoom(-0.25)).pack(side="left")
+        self.sort_zoom_var = tk.StringVar(value="100%")
+        ttk.Label(viewer_toolbar, textvariable=self.sort_zoom_var, style="Glass.TLabel", width=6, anchor="center").pack(
+            side="left", padx=3
+        )
+        ttk.Button(viewer_toolbar, text="Fit", width=5, command=self._fit_sort_page).pack(side="left", padx=3)
+        ttk.Button(viewer_toolbar, text="+", width=3, command=lambda: self._change_sort_zoom(0.25)).pack(side="left")
+
+        rotation_toolbar = ttk.Frame(viewer, style="GlassContent.TFrame")
+        rotation_toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(rotation_toolbar, text="Rotate Preview", style="Glass.TLabel").pack(side="left")
+        ttk.Button(rotation_toolbar, text="Left", width=7, command=lambda: self._rotate_sort_page(-90)).pack(
+            side="left", padx=(8, 3)
+        )
+        ttk.Button(rotation_toolbar, text="Right", width=7, command=lambda: self._rotate_sort_page(90)).pack(side="left")
+
+        sort_canvas_frame = ttk.Frame(viewer, style="GlassContent.TFrame")
+        sort_canvas_frame.pack(fill="both", expand=True)
+        self.sort_page_canvas = tk.Canvas(
+            sort_canvas_frame,
+            background=DARK_THEME["input"],
+            highlightbackground=DARK_THEME["border"],
+            highlightthickness=1,
+        )
+        sort_vertical = ttk.Scrollbar(sort_canvas_frame, orient="vertical", command=self.sort_page_canvas.yview)
+        sort_horizontal = ttk.Scrollbar(sort_canvas_frame, orient="horizontal", command=self.sort_page_canvas.xview)
+        self.sort_page_canvas.configure(yscrollcommand=sort_vertical.set, xscrollcommand=sort_horizontal.set)
+        self.sort_page_canvas.grid(row=0, column=0, sticky="nsew")
+        sort_vertical.grid(row=0, column=1, sticky="ns")
+        sort_horizontal.grid(row=1, column=0, sticky="ew")
+        sort_canvas_frame.rowconfigure(0, weight=1)
+        sort_canvas_frame.columnconfigure(0, weight=1)
+
+        viewer_navigation = ttk.Frame(viewer, style="GlassContent.TFrame")
+        viewer_navigation.pack(fill="x", pady=(8, 0))
+        ttk.Button(viewer_navigation, text="‹ Previous", command=lambda: self._turn_sort_page(-1)).pack(side="left")
+        self.sort_page_status_var = tk.StringVar(value="No document selected")
+        ttk.Label(viewer_navigation, textvariable=self.sort_page_status_var, style="Glass.TLabel", anchor="center").pack(
+            side="left", fill="x", expand=True, padx=8
+        )
+        ttk.Button(viewer_navigation, text="Next ›", command=lambda: self._turn_sort_page(1)).pack(side="right")
+        self.sort_page_index = 0
+        self.sort_page_count = 0
+        self.sort_page_image = None
+        self.sort_zoom_factor = 1.0
+        self.sort_page_rotations = {}
+        self.sort_preview_generation = 0
+        self._set_sort_page_message("Select a document to preview it here.")
+
         self.status_var = tk.StringVar(value="Ready. Click Scan Incoming Documents to analyze PDFs.")
         ttk.Label(self.sort_tab, textvariable=self.status_var, style="Status.TLabel", anchor="w").pack(
-            side="bottom", fill="x", padx=16, pady=(0, 10), before=pane
+            side="bottom", fill="x", padx=16, pady=(0, 10), before=sort_workspace
         )
 
         self._build_database_tab()
@@ -1339,7 +1442,7 @@ class DotReviewApp:
         self.events.put(("bulk_ocr_done", summary))
 
     def scan_incoming(self) -> None:
-        if self.scanning or self.ocr_running:
+        if self.scanning or self.ocr_running or getattr(self, "bulk_action_running", False):
             return
         if self.session_load_error:
             self._show_session_error()
@@ -1499,6 +1602,47 @@ class DotReviewApp:
                     self.scan_button.configure(state="normal")
                     self.status_var.set(f"Bulk OCR could not start: {event[1]}")
                     messagebox.showerror("Bulk OCR unavailable", event[1])
+                elif event[0] == "bulk_not_dot_progress":
+                    _, index, total, filename, detail = event
+                    self.progress.configure(value=index)
+                    self.progress_text.configure(text=f"{index} of {total}")
+                    self.status_var.set(f"Bulk Not DOT {index} of {total}: {filename} • {detail}")
+                elif event[0] == "bulk_not_dot_done":
+                    _, summary = event
+                    self.bulk_action_running = False
+                    self.not_dot_button.configure(state="normal")
+                    self.select_all_button.configure(state="normal")
+                    self.save_correction_button.configure(state="normal")
+                    self.approve_button.configure(state="normal")
+                    self.duplicate_button.configure(state="normal")
+                    self.ocr_button.configure(state="normal")
+                    self.bulk_ocr_button.configure(state="normal")
+                    self.scan_button.configure(state="normal")
+                    self.import_button.configure(state="normal")
+                    self.model = ReviewModel(summary["results"])
+                    self._refresh()
+                    failures = summary["failed"]
+                    self.status_var.set(
+                        f"Bulk Not DOT complete: {summary['completed']} archived, {failures} failed."
+                    )
+                    if failures:
+                        examples = "\n".join(
+                            f"• {item['filename']}: {item['error']}" for item in summary["errors"][:5]
+                        )
+                        messagebox.showwarning(
+                            "Bulk Not DOT completed with failures",
+                            f"{failures} document(s) could not be archived. The remaining selections continued.\n\n{examples}",
+                        )
+                elif event[0] == "sort_preview_done":
+                    _, generation, source, rendered = event
+                    if generation == self.sort_preview_generation and source == self._selected_source():
+                        self._display_sort_page(source, rendered)
+                elif event[0] == "sort_preview_error":
+                    _, generation, source, detail = event
+                    if generation == self.sort_preview_generation and source == self._selected_source():
+                        self.sort_page_count = 0
+                        self._set_sort_page_message(f"This PDF page could not be rendered.\n\n{detail}")
+                        self.sort_page_status_var.set("Page rendering failed")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
@@ -1532,6 +1676,15 @@ class DotReviewApp:
             source = result.get("source_file", "")
             item_id = f"row-{index}"
             status = result.get("status", "")
+            review_notes = "; ".join(
+                self._humanize_user_text(reason) for reason in result.get("reasons", [])
+            )
+            if result.get("non_dot_classification_label"):
+                review_notes = (
+                    f"{result['non_dot_classification_label']}; {review_notes}"
+                    if review_notes
+                    else result["non_dot_classification_label"]
+                )
             self.table.insert(
                 "",
                 "end",
@@ -1544,13 +1697,23 @@ class DotReviewApp:
                     self._document_type_label(result.get("document_type")),
                     self._display_date(result.get("controlling_date")),
                     result.get("proposed_filename") or "",
-                    "; ".join(self._humanize_user_text(reason) for reason in result.get("reasons", [])),
+                    review_notes,
                 ),
                 tags=(status,),
             )
             self.row_sources[item_id] = source
             if source == selected_source:
                 self.table.selection_set(item_id)
+        if not self.table.selection():
+            children = self.table.get_children()
+            if children:
+                first = children[0]
+                self.table.selection_set(first)
+                self.table.focus(first)
+                self.table.see(first)
+                self._on_selection()
+            else:
+                self._clear_sort_selection()
 
     @staticmethod
     def _display_date(value: str | None) -> str:
@@ -1564,6 +1727,24 @@ class DotReviewApp:
     def _selected_source(self) -> str | None:
         selected = self.table.selection()
         return self.row_sources.get(selected[0]) if selected else None
+
+    def _selected_results(self) -> list[dict]:
+        selected = set(self.table.selection())
+        sources = [
+            self.row_sources[item_id]
+            for item_id in self.table.get_children()
+            if item_id in selected and item_id in self.row_sources
+        ]
+        results_by_source = {
+            item.get("source_file"): item
+            for item in self.model.results
+        }
+        return [results_by_source[source] for source in sources if source in results_by_source]
+
+    def select_all_visible(self) -> None:
+        children = self.table.get_children()
+        if children:
+            self.table.selection_set(children)
 
     def _selected_result(self) -> dict | None:
         source = self._selected_source()
@@ -1579,13 +1760,178 @@ class DotReviewApp:
         self.type_var.set(self._document_type_label(result.get("document_type")))
         self.date_var.set(self._display_date(result.get("controlling_date")))
         self.page_var.set(result.get("page_suffix") or "")
-        self.reason_var.set(
-            "; ".join(self._humanize_user_text(reason) for reason in result.get("reasons", []))
-            or "No unresolved issues."
+        review_notes = "; ".join(
+            self._humanize_user_text(reason) for reason in result.get("reasons", [])
         )
+        if result.get("non_dot_classification_label"):
+            review_notes = (
+                f"{result['non_dot_classification_label']}; {review_notes}"
+                if review_notes
+                else result["non_dot_classification_label"]
+            )
+        self.reason_var.set(review_notes or "No unresolved issues.")
         self.destination_var.set(result.get("proposed_destination") or "Not available until all fields are valid.")
+        self.sort_page_index = 0
+        self._render_selected_sort_page()
+
+    def _sort_preview_path(self, result: dict) -> tuple[Path, Path]:
+        status = result.get("status")
+        if status == "duplicate":
+            return Path(result.get("duplicate_archived_file") or ""), self.processed / "Duplicates"
+        if status == "not_dot":
+            return Path(result.get("not_dot_archived_file") or ""), self.exceptions / "Not DOT"
+        return Path(result.get("source_file") or ""), self.incoming
+
+    def _set_sort_page_message(self, message: str) -> None:
+        self.sort_page_image = None
+        self.sort_page_canvas.delete("all")
+        width = max(300, self.sort_page_canvas.winfo_width())
+        height = max(300, self.sort_page_canvas.winfo_height())
+        self.sort_page_canvas.create_text(
+            width // 2,
+            height // 2,
+            text=message,
+            fill=DARK_THEME["muted"],
+            font=("Segoe UI", 11),
+            justify="center",
+            width=max(260, width - 50),
+        )
+        self.sort_page_canvas.configure(scrollregion=(0, 0, width, height))
+
+    def _render_selected_sort_page(self) -> None:
+        result = self._selected_result()
+        if not result:
+            self.sort_page_count = 0
+            self.sort_page_status_var.set("No document selected")
+            self._set_sort_page_message("Select a document to preview it here.")
+            return
+        path, expected_folder = self._sort_preview_path(result)
+        self.sort_preview_generation += 1
+        generation = self.sort_preview_generation
+        source = result.get("source_file", "")
+        rotation = self.sort_page_rotations.get((source, self.sort_page_index), 0)
+        width = max(300, self.sort_page_canvas.winfo_width() - 20)
+        height = max(300, self.sort_page_canvas.winfo_height() - 20)
+        self.sort_page_status_var.set(f"Rendering {path.name}...")
+        threading.Thread(
+            target=self._sort_preview_worker,
+            args=(
+                generation,
+                source,
+                path,
+                expected_folder,
+                self.sort_page_index,
+                width,
+                height,
+                self.sort_zoom_factor,
+                rotation,
+            ),
+            daemon=True,
+        ).start()
+
+    def _sort_preview_worker(
+        self,
+        generation: int,
+        source: str,
+        path: Path,
+        expected_folder: Path,
+        page_index: int,
+        width: int,
+        height: int,
+        zoom_factor: float,
+        rotation: int,
+    ) -> None:
+        try:
+            rendered = render_pdf_page(
+                path,
+                expected_folder,
+                page_index,
+                max_width=width,
+                max_height=height,
+                zoom_factor=zoom_factor,
+                rotation=rotation,
+            )
+        except Exception as error:
+            self.events.put(("sort_preview_error", generation, source, str(error)))
+            return
+        self.events.put(("sort_preview_done", generation, source, rendered))
+
+    def _display_sort_page(self, source: str, rendered: dict) -> None:
+        self.sort_page_image = tk.PhotoImage(data=base64.b64encode(rendered["png"]))
+        self.sort_page_count = rendered["page_count"]
+        self.sort_page_canvas.delete("all")
+        canvas_width = max(1, self.sort_page_canvas.winfo_width())
+        canvas_height = max(1, self.sort_page_canvas.winfo_height())
+        x = max(10, (canvas_width - rendered["width"]) // 2)
+        y = max(10, (canvas_height - rendered["height"]) // 2)
+        self.sort_page_canvas.create_image(x, y, image=self.sort_page_image, anchor="nw")
+        self.sort_page_canvas.configure(
+            scrollregion=(0, 0, max(canvas_width, x + rendered["width"] + 10), max(canvas_height, y + rendered["height"] + 10))
+        )
+        self.sort_page_canvas.xview_moveto(0)
+        self.sort_page_canvas.yview_moveto(0)
+        self.sort_page_status_var.set(f"Page {rendered['page_index'] + 1} of {rendered['page_count']}")
+
+    def _turn_sort_page(self, direction: int) -> None:
+        if not self._selected_result() or self.sort_page_count < 1:
+            return
+        target = min(max(self.sort_page_index + direction, 0), self.sort_page_count - 1)
+        if target != self.sort_page_index:
+            self.sort_page_index = target
+            self._render_selected_sort_page()
+
+    def _change_sort_zoom(self, delta: float) -> None:
+        self.sort_zoom_factor = min(4.0, max(0.25, self.sort_zoom_factor + delta))
+        self.sort_zoom_var.set(f"{round(self.sort_zoom_factor * 100):d}%")
+        self._render_selected_sort_page()
+
+    def _fit_sort_page(self) -> None:
+        self.sort_zoom_factor = 1.0
+        self.sort_zoom_var.set("100%")
+        self._render_selected_sort_page()
+
+    def _rotate_sort_page(self, degrees: int) -> None:
+        source = self._selected_source()
+        if source is None:
+            return
+        key = (source, self.sort_page_index)
+        self.sort_page_rotations[key] = (self.sort_page_rotations.get(key, 0) + degrees) % 360
+        self._render_selected_sort_page()
+
+    @staticmethod
+    def _empty_queue_message(filter_name: str) -> str:
+        return f"No {filter_name} documents remain in the queue."
+
+    def _clear_sort_selection(self) -> None:
+        for variable in (self.unit_var, self.type_var, self.date_var, self.page_var):
+            variable.set("")
+        self.reason_var.set("No document selected.")
+        filter_name = self.filter_var.get()
+        self.destination_var.set(f"Select a {filter_name} document to review.")
+        self.sort_preview_generation += 1
+        self.sort_page_index = 0
+        self.sort_page_count = 0
+        self.sort_page_status_var.set("No document selected")
+        self._set_sort_page_message(self._empty_queue_message(filter_name))
+
+    def _visible_source_order(self) -> tuple[str, ...]:
+        return tuple(
+            item.get("source_file", "")
+            for item in self.model.filtered(self.filter_var.get())
+        )
+
+    def _refresh_and_select_next(self, prior_order: tuple[str, ...], completed_source: str) -> None:
+        self._refresh()
+        target = next_active_source(prior_order, completed_source, self._visible_source_order())
+        if target is None:
+            self._clear_sort_selection()
+            return
+        self._select_source(target)
 
     def save_correction(self) -> None:
+        if getattr(self, "bulk_action_running", False):
+            self.status_var.set("Wait for the bulk Not DOT action to finish.")
+            return
         before = self._selected_result()
         if not before:
             messagebox.showinfo("Select a document", "Select a document to correct.")
@@ -1739,6 +2085,9 @@ class DotReviewApp:
         dialog.focus_set()
 
     def approve_selected(self) -> None:
+        if getattr(self, "bulk_action_running", False):
+            self.status_var.set("Wait for the bulk Not DOT action to finish.")
+            return
         before = self._selected_result()
         if not before:
             messagebox.showinfo("Select a document", "Select a document to approve.")
@@ -1746,6 +2095,7 @@ class DotReviewApp:
         if before.get("status") == "approved":
             messagebox.showwarning("Already approved", "This document has already been approved.")
             return
+        prior_order = self._visible_source_order()
         try:
             corrected = apply_correction(
                 before,
@@ -1779,10 +2129,12 @@ class DotReviewApp:
         self.model.replace(approved)
         save_review_session(self.session_path, self.model.results)
         self.status_var.set(f"Approved and copied: {approved['proposed_filename']}")
-        self._refresh()
-        self._select_source(approved["source_file"])
+        self._refresh_and_select_next(prior_order, approved["source_file"])
 
     def mark_selected_duplicate(self) -> None:
+        if getattr(self, "bulk_action_running", False):
+            self.status_var.set("Wait for the bulk Not DOT action to finish.")
+            return
         result = self._selected_result()
         if not result:
             messagebox.showinfo("Select a document", "Select a document to mark as a duplicate.")
@@ -1793,6 +2145,7 @@ class DotReviewApp:
                 "Approved documents and records already marked duplicate cannot be changed this way.",
             )
             return
+        prior_order = self._visible_source_order()
         source_name = Path(result.get("source_file") or "").name
         if not messagebox.askyesno(
             "Confirm duplicate",
@@ -1820,33 +2173,41 @@ class DotReviewApp:
             return
         self.model.replace(duplicate)
         save_review_session(self.session_path, self.model.results)
-        self.filter_var.set("Active")
         self.status_var.set(f"Marked duplicate and archived: {source_name}")
-        self._refresh()
+        self._refresh_and_select_next(prior_order, duplicate["source_file"])
 
     def mark_selected_not_dot(self) -> None:
-        result = self._selected_result()
-        if not result:
+        if getattr(self, "bulk_action_running", False):
+            self.status_var.set("Wait for the bulk Not DOT action to finish.")
+            return
+        selected = self._selected_results()
+        if not selected:
             messagebox.showinfo("Select a document", "Select a document to remove from the DOT workflow.")
             return
-        if result.get("status") in {"approved", "duplicate", "not_dot"}:
+        ineligible = [
+            result
+            for result in selected
+            if result.get("status") in {"approved", "duplicate", "not_dot"}
+        ]
+        if ineligible:
             messagebox.showwarning(
                 "Cannot remove document",
-                "Approved, duplicate, and Not DOT records cannot be changed this way.",
+                "The selection includes Approved, Duplicate, or Not DOT records. Select only active review documents.",
             )
             return
+        if len(selected) > 1:
+            self._start_bulk_not_dot(selected)
+            return
+        result = selected[0]
+        prior_order = self._visible_source_order()
         source_name = Path(result.get("source_file") or "").name
-        if not messagebox.askyesno(
-            "Confirm Not DOT document",
-            f"Remove {source_name} from the DOT workflow?\n\n"
-            "The PDF will be moved to Exceptions\\Not DOT and removed from the Active review list. "
-            "It will not be copied to any unit folder.",
-            icon="warning",
-        ):
+        classification = self._choose_non_dot_classification(source_name)
+        if classification is None:
             return
         try:
             not_dot = mark_not_dot_document(
                 result,
+                classification=classification,
                 audit_path=self.audit_path,
                 incoming_folder=self.incoming,
                 exceptions_folder=self.exceptions,
@@ -1856,9 +2217,147 @@ class DotReviewApp:
             return
         self.model.replace(not_dot)
         save_review_session(self.session_path, self.model.results)
-        self.filter_var.set("Active")
-        self.status_var.set(f"Removed from DOT workflow: {source_name}")
-        self._refresh()
+        self.status_var.set(
+            f"Classified as {not_dot['non_dot_classification_label']} and removed from DOT workflow: {source_name}"
+        )
+        self._refresh_and_select_next(prior_order, not_dot["source_file"])
+
+    def _start_bulk_not_dot(self, candidates: list[dict]) -> None:
+        if self.scanning or self.ocr_running or getattr(self, "bulk_action_running", False):
+            self.status_var.set("Wait for the current scan, OCR, or bulk action to finish.")
+            return
+        classification = self._choose_non_dot_classification(f"{len(candidates)} selected documents")
+        if classification is None:
+            return
+        label = NON_DOT_DOCUMENT_TYPES[classification]
+        filter_name = self.filter_var.get()
+        if not messagebox.askyesno(
+            "Confirm bulk Not DOT",
+            f"Classify and archive {len(candidates)} selected documents from {filter_name} as {label}?\n\n"
+            "Each source fingerprint will be verified. Failures will be left in place and the batch will continue.",
+            parent=self.root,
+            icon="warning",
+        ):
+            return
+        self.bulk_action_running = True
+        self.not_dot_button.configure(state="disabled")
+        self.select_all_button.configure(state="disabled")
+        self.save_correction_button.configure(state="disabled")
+        self.approve_button.configure(state="disabled")
+        self.duplicate_button.configure(state="disabled")
+        self.ocr_button.configure(state="disabled")
+        self.bulk_ocr_button.configure(state="disabled")
+        self.scan_button.configure(state="disabled")
+        self.import_button.configure(state="disabled")
+        self.progress.configure(maximum=len(candidates), value=0)
+        self.progress_text.configure(text=f"0 of {len(candidates)}")
+        self.status_var.set(f"Starting bulk Not DOT for {len(candidates)} documents...")
+        snapshot = [dict(item) for item in self.model.results]
+        threading.Thread(
+            target=self._bulk_not_dot_worker,
+            args=([dict(item) for item in candidates], classification, snapshot),
+            daemon=True,
+        ).start()
+
+    def _bulk_not_dot_worker(
+        self,
+        candidates: list[dict],
+        classification: str,
+        results: list[dict],
+    ) -> None:
+        completed = 0
+        errors = []
+        total = len(candidates)
+        indexes = {item.get("source_file"): index for index, item in enumerate(results)}
+        for index, result in enumerate(candidates, start=1):
+            filename = Path(result.get("source_file") or "").name
+            try:
+                not_dot = mark_not_dot_document(
+                    result,
+                    classification=classification,
+                    audit_path=self.audit_path,
+                    incoming_folder=self.incoming,
+                    exceptions_folder=self.exceptions,
+                )
+                result_index = indexes.get(not_dot.get("source_file"))
+                if result_index is None:
+                    results.append(not_dot)
+                    indexes[not_dot.get("source_file")] = len(results) - 1
+                else:
+                    results[result_index] = not_dot
+                save_review_session(self.session_path, results)
+                completed += 1
+                detail = "archived"
+            except Exception as error:
+                errors.append({"filename": filename, "error": str(error)})
+                detail = "failed"
+            self.events.put(("bulk_not_dot_progress", index, total, filename, detail))
+        self.events.put(
+            (
+                "bulk_not_dot_done",
+                {
+                    "completed": completed,
+                    "failed": len(errors),
+                    "errors": errors,
+                    "total": total,
+                    "results": results,
+                },
+            )
+        )
+
+    def _choose_non_dot_classification(self, source_name: str) -> str | None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Classify Not DOT Document")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(background=DARK_THEME["surface"])
+        selected_label = tk.StringVar()
+        choice = {"code": None}
+
+        ttk.Label(
+            dialog,
+            text=f"Choose the classification for {source_name}:",
+            style="Glass.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(18, 8))
+        selector = ttk.Combobox(
+            dialog,
+            textvariable=selected_label,
+            values=tuple(NON_DOT_DOCUMENT_TYPES.values()),
+            state="readonly",
+            width=32,
+        )
+        selector.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 10))
+        ttk.Label(
+            dialog,
+            text="The PDF will be archived under Exceptions\\Not DOT.\n"
+            "This classification will be saved for future classifier training.",
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 14))
+
+        def archive() -> None:
+            label = selected_label.get()
+            code = next((key for key, value in NON_DOT_DOCUMENT_TYPES.items() if value == label), None)
+            if code is None:
+                messagebox.showwarning(
+                    "Choose a classification",
+                    "Select a document classification before archiving.",
+                    parent=dialog,
+                )
+                return
+            choice["code"] = code
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Cancel", command=dialog.destroy).grid(
+            row=3, column=0, sticky="e", padx=(18, 6), pady=(0, 18)
+        )
+        ttk.Button(dialog, text="Classify and Archive", command=archive).grid(
+            row=3, column=1, sticky="w", padx=(6, 18), pady=(0, 18)
+        )
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.grab_set()
+        selector.focus_set()
+        dialog.wait_window()
+        return choice["code"]
 
     def restore_selected(self) -> None:
         result = self._selected_result()

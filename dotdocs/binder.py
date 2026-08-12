@@ -13,6 +13,7 @@ BINDER_SECTIONS = (
     ("Insurance", "002_Insurance"),
     ("Registration", "003_Registration"),
     ("Maintenance", "004_Maintenance_Records"),
+    ("Misc", "005_Misc"),
 )
 _SECTION_FOLDERS = {folder for _label, folder in BINDER_SECTIONS}
 
@@ -114,23 +115,46 @@ def render_binder_page(
     max_height: int = 700,
     zoom_factor: float = 1.0,
 ) -> dict:
+    return render_pdf_page(
+        pdf_path,
+        expected_folder,
+        page_index,
+        max_width=max_width,
+        max_height=max_height,
+        zoom_factor=zoom_factor,
+    )
+
+
+def render_pdf_page(
+    pdf_path: str | Path,
+    expected_folder: str | Path,
+    page_index: int,
+    *,
+    max_width: int = 900,
+    max_height: int = 700,
+    zoom_factor: float = 1.0,
+    rotation: int = 0,
+) -> dict:
     path = Path(pdf_path)
     folder = Path(expected_folder)
     if path.suffix.lower() != ".pdf" or path.resolve().parent != folder.resolve():
-        raise ValueError("The selected PDF is not directly inside the active binder section.")
+        raise ValueError("The selected PDF is not directly inside the expected folder.")
     if not path.is_file():
-        raise ValueError("The selected binder PDF is unavailable.")
+        raise ValueError("The selected PDF is unavailable.")
     if max_width < 1 or max_height < 1:
         raise ValueError("The page rendering area is invalid.")
     if not 0.25 <= zoom_factor <= 4.0:
-        raise ValueError("The binder zoom must be between 25% and 400%.")
+        raise ValueError("The PDF zoom must be between 25% and 400%.")
+    if rotation not in {0, 90, 180, 270}:
+        raise ValueError("The PDF preview rotation must be 0, 90, 180, or 270 degrees.")
     with fitz.open(path) as document:
         page_count = document.page_count
         if page_index < 0 or page_index >= page_count:
             raise IndexError("The requested PDF page is outside the document.")
         page = document.load_page(page_index)
-        zoom = min(max_width / page.rect.width, max_height / page.rect.height, 2.0) * zoom_factor
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        rotated_rect = page.rect * fitz.Matrix(1, 1).prerotate(rotation)
+        zoom = min(max_width / rotated_rect.width, max_height / rotated_rect.height, 2.0) * zoom_factor
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom).prerotate(rotation), alpha=False)
         png = pixmap.tobytes("png")
     return {
         "png": png,
@@ -138,4 +162,5 @@ def render_binder_page(
         "page_count": page_count,
         "width": pixmap.width,
         "height": pixmap.height,
+        "rotation": rotation,
     }

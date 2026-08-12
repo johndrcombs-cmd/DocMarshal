@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import fitz
@@ -10,6 +11,7 @@ from dotdocs.binder import (
     list_binder_documents,
     list_binders,
     render_binder_page,
+    render_pdf_page,
 )
 from dotdocs.database import import_fleet_workbook
 
@@ -61,6 +63,7 @@ def test_lists_only_direct_pdfs_in_a_canonical_binder_tab(tmp_path):
         "002_Insurance",
         "003_Registration",
         "004_Maintenance_Records",
+        "005_Misc",
     }
 
 
@@ -83,6 +86,61 @@ def test_renders_one_safe_pdf_page_at_a_time(tmp_path):
         render_binder_page(pdf_path, tmp_path, 0)
     with pytest.raises(IndexError, match="page"):
         render_binder_page(pdf_path, section, 2)
+
+
+def test_render_pdf_page_supports_safe_read_only_incoming_preview(tmp_path):
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    pdf = incoming / "review.pdf"
+    document = fitz.open()
+    document.new_page(width=320, height=480)
+    document.new_page(width=320, height=480)
+    document.save(pdf)
+    document.close()
+
+    rendered = render_pdf_page(pdf, incoming, 1, max_width=240, max_height=240)
+
+    assert rendered["page_index"] == 1
+    assert rendered["page_count"] == 2
+    assert rendered["png"].startswith(b"\x89PNG")
+
+
+def test_render_pdf_page_rotates_preview_without_modifying_source(tmp_path):
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    pdf = incoming / "upside-down.pdf"
+    document = fitz.open()
+    document.new_page(width=200, height=400)
+    document.save(pdf)
+    document.close()
+    before = hashlib.sha256(pdf.read_bytes()).hexdigest()
+
+    rendered = render_pdf_page(
+        pdf,
+        incoming,
+        0,
+        max_width=800,
+        max_height=800,
+        rotation=90,
+    )
+
+    assert rendered["width"] == 800
+    assert rendered["height"] == 400
+    assert rendered["rotation"] == 90
+    assert hashlib.sha256(pdf.read_bytes()).hexdigest() == before
+
+
+def test_render_pdf_page_rejects_non_quarter_turn_rotation(tmp_path):
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    pdf = incoming / "review.pdf"
+    document = fitz.open()
+    document.new_page()
+    document.save(pdf)
+    document.close()
+
+    with pytest.raises(ValueError, match="rotation"):
+        render_pdf_page(pdf, incoming, 0, rotation=45)
 
 
 def test_binder_navigation_advances_through_pages_documents_and_categories():

@@ -119,3 +119,85 @@ def test_does_not_guess_unit_from_invoice_payment_terms(tmp_path):
 
     assert result["status"] == "unmatched"
     assert result["units"] == []
+
+
+def test_matches_flattened_invoice_row_using_unique_database_vehicle_description(tmp_path):
+    database = _fleet_database(tmp_path)
+    result = match_units_in_text(
+        database,
+        "Invoice Year Make Model Unit Number Mileage Rep Terms "
+        "2023 FORD F-350 223 RP Net 30 extended service description and customer notes Parts",
+    )
+
+    assert result["status"] == "unique"
+    assert result["units"] == ["223"]
+    assert result["evidence"]["223"] == ["VEHICLE_ROW:223"]
+
+
+def test_vehicle_description_fallback_does_not_treat_item_price_as_unit(tmp_path):
+    database = _fleet_database(tmp_path)
+    result = match_units_in_text(
+        database,
+        "Invoice Year Make Model Unit Number 2023 FORD F-350 service description "
+        "Diesel Oil Change Parts 52.00 Net 30",
+    )
+
+    assert result["status"] == "unmatched"
+    assert result["units"] == []
+
+
+def test_vehicle_description_fallback_refuses_multiple_matching_assets(tmp_path):
+    database = _fleet_database(tmp_path)
+    result = match_units_in_text(
+        database,
+        "Invoice Year Make Model Unit Number Mileage Rep Terms "
+        "2023 FORD F-350 extended notes for fleet assets 223 and 225 RP Net 30 Parts",
+    )
+
+    assert result["status"] == "unmatched"
+    assert result["units"] == []
+
+
+def test_vehicle_description_fallback_ignores_matching_number_far_from_vehicle_row(tmp_path):
+    database = _fleet_database(tmp_path)
+    result = match_units_in_text(
+        database,
+        "Invoice Year Make Model Unit Number 2023 FORD F-350 "
+        "service description with extensive customer complaint and repair notes "
+        "Parts item extended price 223 Net 30",
+    )
+
+    assert result["status"] == "unmatched"
+    assert result["units"] == []
+
+
+def test_vehicle_description_fallback_rejects_generic_model_evidence(tmp_path):
+    database = _fleet_database(tmp_path)
+    result = match_units_in_text(
+        database,
+        "Invoice Year Make Model Unit Number 2010 PTRB SEMI 91 Net 30",
+    )
+
+    assert result["status"] == "unmatched"
+    assert result["units"] == []
+
+
+def test_vehicle_description_fallback_rejects_duplicate_normalized_unit_rows(tmp_path):
+    database = _fleet_database(tmp_path)
+    import sqlite3
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO units "
+            "(source_row, display_unit, normalized_unit, unit_type, year, make, model, "
+            "vehicle_type, plate, vin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (999, "223 duplicate", "223", "Truck", "2023", "FORD", "F-350", "Truck", "", ""),
+        )
+
+    result = match_units_in_text(
+        database,
+        "Invoice Year Make Model Unit Number 2023 FORD F-350 223 Net 30",
+    )
+
+    assert result["status"] == "unmatched"
+    assert result["units"] == []
