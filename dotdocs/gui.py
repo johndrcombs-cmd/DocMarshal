@@ -157,6 +157,23 @@ class DotReviewApp:
         )
         self.status_var.set("Scanning disabled: active review session could not be loaded.")
 
+    @staticmethod
+    def _scroll_canvas_with_mouse_wheel(canvas: tk.Canvas, event) -> str:
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            direction = -1
+        elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            direction = 1
+        else:
+            return "break"
+        canvas.yview_scroll(direction, "units")
+        return "break"
+
+    def _bind_canvas_mouse_wheel(self, canvas: tk.Canvas) -> None:
+        callback = lambda event: self._scroll_canvas_with_mouse_wheel(canvas, event)
+        canvas.bind("<MouseWheel>", callback)
+        canvas.bind("<Button-4>", callback)
+        canvas.bind("<Button-5>", callback)
+
     def _apply_app_icon(self) -> None:
         self.app_icon_image = None
         self.header_icon_image = None
@@ -682,6 +699,7 @@ class DotReviewApp:
         sort_vertical = ttk.Scrollbar(sort_canvas_frame, orient="vertical", command=self.sort_page_canvas.yview)
         sort_horizontal = ttk.Scrollbar(sort_canvas_frame, orient="horizontal", command=self.sort_page_canvas.xview)
         self.sort_page_canvas.configure(yscrollcommand=sort_vertical.set, xscrollcommand=sort_horizontal.set)
+        self._bind_canvas_mouse_wheel(self.sort_page_canvas)
         self.sort_page_canvas.grid(row=0, column=0, sticky="nsew")
         sort_vertical.grid(row=0, column=1, sticky="ns")
         sort_horizontal.grid(row=1, column=0, sticky="ew")
@@ -1022,6 +1040,7 @@ class DotReviewApp:
         )
         shelf_scroll = ttk.Scrollbar(shelf_frame, orient="vertical", command=self.binder_shelf.yview)
         self.binder_shelf.configure(yscrollcommand=shelf_scroll.set)
+        self._bind_canvas_mouse_wheel(self.binder_shelf)
         self.binder_shelf.pack(side="left", fill="both", expand=True)
         shelf_scroll.pack(side="right", fill="y")
         self.binder_shelf.bind("<Button-1>", self._select_binder_from_shelf)
@@ -1057,6 +1076,7 @@ class DotReviewApp:
             yscrollcommand=binder_vertical.set,
             xscrollcommand=binder_horizontal.set,
         )
+        self._bind_canvas_mouse_wheel(self.binder_page_canvas)
         self.binder_page_canvas.grid(row=0, column=0, sticky="nsew")
         binder_vertical.grid(row=0, column=1, sticky="ns")
         binder_horizontal.grid(row=1, column=0, sticky="ew")

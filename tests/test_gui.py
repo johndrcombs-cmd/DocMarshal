@@ -47,6 +47,15 @@ class _Widget:
         self.bindings[sequence] = callback
 
 
+class _ScrollableWidget(_Widget):
+    def __init__(self):
+        super().__init__()
+        self.scrolls = []
+
+    def yview_scroll(self, amount, unit):
+        self.scrolls.append((amount, unit))
+
+
 class _SelectionTable:
     def __init__(self, children, selected=()):
         self.children = tuple(children)
@@ -138,6 +147,28 @@ def test_sort_and_virtual_binder_expose_import_ocr_zoom_and_sequence_controls():
     assert 'text="Right"' in source
     assert 'text="Select All Visible"' in source
     assert 'selectmode="extended"' in source
+
+
+def test_canvas_mouse_wheel_bindings_scroll_vertically_and_stop_propagation():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    canvas = _ScrollableWidget()
+
+    app._bind_canvas_mouse_wheel(canvas)
+
+    assert set(canvas.bindings) == {"<MouseWheel>", "<Button-4>", "<Button-5>"}
+    assert canvas.bindings["<MouseWheel>"](type("Event", (), {"delta": 120})()) == "break"
+    assert canvas.bindings["<MouseWheel>"](type("Event", (), {"delta": -120})()) == "break"
+    assert canvas.bindings["<Button-4>"](type("Event", (), {"num": 4})()) == "break"
+    assert canvas.bindings["<Button-5>"](type("Event", (), {"num": 5})()) == "break"
+    assert canvas.scrolls == [(-1, "units"), (1, "units"), (-1, "units"), (1, "units")]
+
+
+def test_all_scrollable_document_surfaces_receive_mouse_wheel_bindings():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert "self._bind_canvas_mouse_wheel(self.sort_page_canvas)" in source
+    assert "self._bind_canvas_mouse_wheel(self.binder_shelf)" in source
+    assert "self._bind_canvas_mouse_wheel(self.binder_page_canvas)" in source
 
 
 def test_select_all_visible_selects_every_displayed_queue_row():
