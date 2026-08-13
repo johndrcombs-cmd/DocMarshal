@@ -15,6 +15,7 @@ from dotdocs.analysis import classify_document, extract_controlling_date
         ("MANUFACTURER'S CERTIFICATE OF ORIGIN Date Issued 4/16/2026", "CERTORIGIN"),
         ("OKLAHOMA APPORTIONED CAB CARD Registration Expires 6/30/2026", "CAB"),
         ("Little B's Two, LLC Invoice Unit No 97 Balance Due", "RP"),
+        ("ISO 17025 CERTIFICATE OF CALIBRATION Serial No. SN-441 Due Date 9/30/2027", "CAL"),
     ],
 )
 def test_classifies_supported_fleet_documents(text, expected):
@@ -30,6 +31,7 @@ def test_classifies_supported_fleet_documents(text, expected):
         ("INS", "Effective Date 02/01/2025 Expiration Date 02/01/2026", date(2026, 2, 1)),
         ("TITLE", "Issue Date 4/15/2026", date(2026, 4, 15)),
         ("CERTORIGIN", "Date Issued 4/16/2026", date(2026, 4, 16)),
+        ("CAL", "Calibration Date 9/30/2026 Due Date 9/30/2027", date(2027, 9, 30)),
     ],
 )
 def test_extracts_the_document_type_controlling_date(document_type, text, expected):
@@ -45,6 +47,10 @@ def test_extracts_cab_card_registration_expiration():
 
 def test_does_not_guess_when_the_controlling_date_is_missing():
     assert extract_controlling_date("ANNUAL VEHICLE INSPECTION REPORT", "DOT") is None
+
+
+def test_does_not_classify_a_generic_certificate_as_calibration():
+    assert classify_document("Certificate of completion issued to employee") is None
 
 
 def test_uses_first_header_date_for_invoice_when_ocr_separates_labels_and_values():

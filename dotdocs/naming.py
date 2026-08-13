@@ -4,6 +4,7 @@ import re
 from datetime import date
 
 from .normalization import normalize_unit
+from .tools_database import normalize_tool_identifier
 
 DESTINATION_SUBFOLDERS = {
     "DOT": "001_Annual_DOT",
@@ -14,10 +15,13 @@ DESTINATION_SUBFOLDERS = {
     "CAB": "003_Registration",
     "RP": "004_Maintenance_Records",
     "MISC": "005_Misc",
+    "CAL": "001_Calibration_Certifications",
 }
 
-DOCUMENT_TYPE_CHOICES = ("DOT", "RP", "REG", "TITLE", "CERTORIGIN", "CAB", "INS", "MISC")
-STANDARD_SUBFOLDERS = tuple(dict.fromkeys(DESTINATION_SUBFOLDERS.values()))
+DOCUMENT_TYPE_CHOICES = ("DOT", "RP", "REG", "TITLE", "CERTORIGIN", "CAB", "INS", "MISC", "CAL")
+STANDARD_SUBFOLDERS = tuple(
+    dict.fromkeys(folder for document_type, folder in DESTINATION_SUBFOLDERS.items() if document_type != "CAL")
+)
 
 
 def _normalize_document_type(document_type: str) -> str:
@@ -53,3 +57,15 @@ def build_filename(
 
 def destination_subfolder(document_type: str) -> str:
     return DESTINATION_SUBFOLDERS[_normalize_document_type(document_type)]
+
+
+def build_tool_filename(tool_id: str, controlling_date: date, *, suffix: str | None = None) -> str:
+    if not normalize_tool_identifier(tool_id):
+        raise ValueError("A Tool ID is required")
+    safe_tool_id = _safe_suffix(str(tool_id).upper())
+    stem = f"{safe_tool_id}_CAL_{controlling_date:%m-%d-%Y}"
+    if suffix:
+        safe_suffix = _safe_suffix(suffix)
+        if safe_suffix:
+            stem += f"_{safe_suffix}"
+    return stem + ".pdf"

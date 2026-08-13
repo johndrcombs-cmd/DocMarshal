@@ -13,10 +13,12 @@ from pathlib import Path
 from ctypes import wintypes
 
 from .assets import AssetValidationError, asset_folder_root, ensure_standard_unit_folder
+from .binder import TOOL_BINDER_SECTIONS
 from .database import find_asset_owner
-from .naming import DOCUMENT_TYPE_CHOICES, build_filename, destination_subfolder
+from .naming import DOCUMENT_TYPE_CHOICES, build_filename, build_tool_filename, destination_subfolder
 from .normalization import normalize_unit
 from .processor import find_unit_folder
+from .tools_database import add_tool_certification, get_tool_by_identifier, remove_tool_certification
 
 ALLOWED_DOCUMENT_TYPES = set(DOCUMENT_TYPE_CHOICES)
 DOCUMENT_TYPE_ERROR = "Choose a valid document type: " + ", ".join(DOCUMENT_TYPE_CHOICES) + "."
@@ -228,46 +230,59 @@ def apply_correction(
     page_suffix: str | None = None,
     unit_folders_root: str | Path,
     farm_asset_folders_root: str | Path | None = None,
+    tool_folders_root: str | Path | None = None,
     database_path: str | Path | None = None,
     audit_path: str | Path | None = None,
 ) -> dict:
-    normalized_unit = normalize_unit(unit)
-    if not normalized_unit:
-        raise ReviewValidationError("A unit number is required.")
-
     normalized_type = document_type.strip().upper()
     if normalized_type not in ALLOWED_DOCUMENT_TYPES:
         raise ReviewValidationError(DOCUMENT_TYPE_ERROR)
 
     parsed_date = _parse_review_date(controlling_date)
     normalized_page_suffix = _normalize_page_suffix(page_suffix)
-    trusted_owner = find_asset_owner(database_path, normalized_unit) if database_path else result.get("asset_owner")
-    try:
-        if database_path is not None and audit_path is not None:
-            unit_folder, trusted_owner = ensure_standard_unit_folder(
-                database_path=database_path,
-                audit_path=audit_path,
-                unit_folders_root=unit_folders_root,
-                farm_asset_folders_root=farm_asset_folders_root,
-                unit=normalized_unit,
-            )
-        else:
-            selected_root = asset_folder_root(
-                trusted_owner, unit_folders_root, farm_asset_folders_root
-            )
-            unit_folder = find_unit_folder(selected_root, normalized_unit)
-    except AssetValidationError as error:
-        raise ReviewValidationError(str(error)) from error
-    if unit_folder is None:
-        raise ReviewValidationError(f"No production folder was found for unit {normalized_unit}.")
-
-    filename = build_filename(
-        normalized_unit,
-        normalized_type,
-        parsed_date,
-        suffix=normalized_page_suffix,
-    )
-    destination = unit_folder / destination_subfolder(normalized_type) / filename
+    is_tool = normalized_type == "CAL" or result.get("subject_type") == "tool"
+    tool = None
+    if is_tool:
+        if normalized_type != "CAL" or database_path is None or tool_folders_root is None:
+            raise ReviewValidationError("Calibration documents require the tool database and Tool Binder root.")
+        try:
+            tool = get_tool_by_identifier(database_path, unit)
+        except ValueError as error:
+            raise ReviewValidationError(str(error)) from error
+        tool_root = Path(tool_folders_root)
+        tool_folder = tool_root / f"Tool_{tool['display_tool_id']}"
+        if not tool_root.is_dir():
+            raise ReviewValidationError(f"The configured Tool Binder root does not exist: {tool_root}")
+        if tool_folder.parent.resolve() != tool_root.resolve():
+            raise ReviewValidationError("The Tool Binder path is unsafe.")
+        tool_folder.mkdir(exist_ok=True)
+        for _label, section_folder in TOOL_BINDER_SECTIONS:
+            (tool_folder / section_folder).mkdir(exist_ok=True)
+        normalized_unit = ""
+        trusted_owner = None
+        filename = build_tool_filename(tool["display_tool_id"], parsed_date, suffix=normalized_page_suffix)
+        destination = tool_folder / destination_subfolder(normalized_type) / filename
+    else:
+        normalized_unit = normalize_unit(unit)
+        if not normalized_unit:
+            raise ReviewValidationError("A unit number is required.")
+        trusted_owner = find_asset_owner(database_path, normalized_unit) if database_path else result.get("asset_owner")
+        try:
+            if database_path is not None and audit_path is not None:
+                unit_folder, trusted_owner = ensure_standard_unit_folder(
+                    database_path=database_path, audit_path=audit_path,
+                    unit_folders_root=unit_folders_root,
+                    farm_asset_folders_root=farm_asset_folders_root, unit=normalized_unit,
+                )
+            else:
+                selected_root = asset_folder_root(trusted_owner, unit_folders_root, farm_asset_folders_root)
+                unit_folder = find_unit_folder(selected_root, normalized_unit)
+        except AssetValidationError as error:
+            raise ReviewValidationError(str(error)) from error
+        if unit_folder is None:
+            raise ReviewValidationError(f"No production folder was found for unit {normalized_unit}.")
+        filename = build_filename(normalized_unit, normalized_type, parsed_date, suffix=normalized_page_suffix)
+        destination = unit_folder / destination_subfolder(normalized_type) / filename
     if not destination.parent.is_dir():
         raise ReviewValidationError(f"The destination folder does not exist: {destination.parent}")
     if destination.exists():
@@ -275,7 +290,7 @@ def apply_correction(
 
     review_fields_changed = any(
         (
-            normalize_unit(result.get("unit") or "") != normalized_unit,
+            (str(result.get("subject_id") or "") != tool["display_tool_id"]) if is_tool else (normalize_unit(result.get("unit") or "") != normalized_unit),
             str(result.get("document_type") or "").strip().upper() != normalized_type,
             result.get("controlling_date") != parsed_date.isoformat(),
             result.get("page_suffix") != normalized_page_suffix,
@@ -287,7 +302,10 @@ def apply_correction(
         {
             "status": "ready_for_review",
             "reasons": [],
-            "unit": normalized_unit,
+            "unit": None if is_tool else normalized_unit,
+            "subject_type": "tool" if is_tool else "fleet_unit",
+            "subject_id": tool["display_tool_id"] if is_tool else normalized_unit,
+            "tool_database_id": tool["id"] if is_tool else None,
             "asset_owner": trusted_owner,
             "document_type": normalized_type,
             "controlling_date": parsed_date.isoformat(),
@@ -739,6 +757,7 @@ def approve_document(
     incoming_folder: str | Path,
     approved_folder: str | Path,
     farm_asset_folders_root: str | Path | None = None,
+    tool_folders_root: str | Path | None = None,
     database_path: str | Path | None = None,
 ) -> dict:
     source = Path(result.get("source_file") or "")
@@ -790,32 +809,45 @@ def approve_document(
     if destination is None:
         fail("The document has no proposed destination.")
 
-    unit = normalize_unit(result.get("unit") or "")
     document_type = (result.get("document_type") or "").upper()
-    if not unit or document_type not in ALLOWED_DOCUMENT_TYPES:
-        fail("The approved unit or document type is invalid.")
+    is_tool = result.get("subject_type") == "tool" or document_type == "CAL"
+    unit = normalize_unit(result.get("unit") or "")
+    if document_type not in ALLOWED_DOCUMENT_TYPES or (not is_tool and not unit):
+        fail("The approved subject or document type is invalid.")
     try:
         controlling_date = _parse_review_date(result.get("controlling_date") or "")
         page_suffix = _normalize_page_suffix(result.get("page_suffix"))
     except ReviewValidationError as error:
         fail(str(error))
-    trusted_owner = find_asset_owner(database_path, unit) if database_path else result.get("asset_owner")
-    if database_path and result.get("asset_owner") != trusted_owner:
-        fail("The asset ownership changed or does not match the fleet database; scan it again.")
-    try:
-        selected_root = asset_folder_root(trusted_owner, unit_folders_root, farm_asset_folders_root)
-    except AssetValidationError as error:
-        fail(str(error))
-    unit_folder = find_unit_folder(selected_root, unit)
-    if unit_folder is None:
-        fail(f"No production folder was found for unit {unit}.")
-    expected_filename = build_filename(
-        unit,
-        document_type,
-        controlling_date,
-        suffix=page_suffix,
-    )
-    expected_destination = unit_folder / destination_subfolder(document_type) / expected_filename
+    if is_tool:
+        if document_type != "CAL" or database_path is None or tool_folders_root is None:
+            fail("Calibration approval requires the tool database and Tool Binder root.")
+        try:
+            tool = get_tool_by_identifier(database_path, result.get("subject_id"))
+        except ValueError as error:
+            fail(str(error))
+        if result.get("tool_database_id") != tool["id"]:
+            fail("The selected tool changed or does not match the tool database; scan it again.")
+        tool_root = Path(tool_folders_root)
+        subject_folder = tool_root / f"Tool_{tool['display_tool_id']}"
+        if not subject_folder.is_dir() or subject_folder.resolve().parent != tool_root.resolve():
+            fail(f"No safe production Tool Binder was found for {tool['display_tool_id']}.")
+        expected_filename = build_tool_filename(tool["display_tool_id"], controlling_date, suffix=page_suffix)
+        expected_destination = subject_folder / destination_subfolder(document_type) / expected_filename
+        trusted_owner = None
+    else:
+        trusted_owner = find_asset_owner(database_path, unit) if database_path else result.get("asset_owner")
+        if database_path and result.get("asset_owner") != trusted_owner:
+            fail("The asset ownership changed or does not match the fleet database; scan it again.")
+        try:
+            selected_root = asset_folder_root(trusted_owner, unit_folders_root, farm_asset_folders_root)
+        except AssetValidationError as error:
+            fail(str(error))
+        unit_folder = find_unit_folder(selected_root, unit)
+        if unit_folder is None:
+            fail(f"No production folder was found for unit {unit}.")
+        expected_filename = build_filename(unit, document_type, controlling_date, suffix=page_suffix)
+        expected_destination = unit_folder / destination_subfolder(document_type) / expected_filename
     if destination.resolve() != expected_destination.resolve():
         fail(
             "The proposed destination does not match the validated production path: "
@@ -869,6 +901,7 @@ def approve_document(
     archive_hash = None
     archive_size = None
     source_removed = False
+    certification_id = None
     try:
         approved_folder.mkdir(parents=True, exist_ok=True)
         archive = approved_folder / source.name
@@ -893,6 +926,21 @@ def approve_document(
                 "approved_at_utc": datetime.now(timezone.utc).isoformat(),
             }
         )
+        if is_tool:
+            certification = add_tool_certification(
+                database_path,
+                tool["id"],
+                {
+                    "certificate_type": "calibration",
+                    "due_date": controlling_date.isoformat(),
+                    "result": "unknown",
+                    "document_path": str(destination),
+                    "document_sha256": expected_hash,
+                    "source_review_id": str(source),
+                },
+            )
+            certification_id = certification["id"]
+            approved["tool_certification_id"] = certification_id
         _append_audit(
             audit_path,
             {
@@ -901,6 +949,8 @@ def approve_document(
                 "archived_file": str(archive) if archive is not None else None,
                 "destination": str(destination),
                 "unit": approved.get("unit"),
+                "subject_type": approved.get("subject_type"),
+                "subject_id": approved.get("subject_id"),
                 "asset_owner": approved.get("asset_owner"),
                 "document_type": approved.get("document_type"),
                 "controlling_date": approved.get("controlling_date"),
@@ -910,6 +960,11 @@ def approve_document(
         )
     except Exception as error:
         rollback_errors = []
+        if certification_id is not None and database_path is not None:
+            try:
+                remove_tool_certification(database_path, certification_id)
+            except Exception as rollback_error:
+                rollback_errors.append(f"calibration history rollback failed: {rollback_error}")
         try:
             if (
                 source_removed

@@ -7,6 +7,9 @@ import sqlite3
 
 import fitz
 
+from .tool_calibration import calibration_status
+from .tools_database import list_tool_certifications, list_tools
+
 
 BINDER_SECTIONS = (
     ("Annual DOT", "001_Annual_DOT"),
@@ -15,7 +18,11 @@ BINDER_SECTIONS = (
     ("Maintenance", "004_Maintenance_Records"),
     ("Misc", "005_Misc"),
 )
-_SECTION_FOLDERS = {folder for _label, folder in BINDER_SECTIONS}
+TOOL_BINDER_SECTIONS = (
+    ("Calibration / Certification", "001_Calibration_Certifications"),
+    ("Misc", "002_Misc"),
+)
+_SECTION_FOLDERS = {folder for _label, folder in (*BINDER_SECTIONS, *TOOL_BINDER_SECTIONS)}
 
 
 def advance_binder_position(
@@ -85,6 +92,26 @@ def list_binders(
             }
         )
     return sorted(binders, key=lambda item: (len(item["unit"]), item["unit"]))
+
+
+def list_tool_binders(database_path: str | Path, tool_folders_root: str | Path) -> list[dict]:
+    root = Path(tool_folders_root)
+    binders = []
+    for tool in list_tools(database_path, include_inactive=False):
+        folder = root / f"Tool_{tool['display_tool_id']}"
+        history = list_tool_certifications(database_path, tool["id"])
+        latest = history[0] if history else {}
+        status = calibration_status(latest.get("due_date"), result=latest.get("result"))
+        binders.append({
+            "database_id": tool["id"],
+            "tool_id": tool["display_tool_id"],
+            "description": tool["description"],
+            "folder": folder,
+            "available": folder.is_dir() and folder.resolve().parent == root.resolve(),
+            "due_date": latest.get("due_date") or "",
+            "status": status,
+        })
+    return sorted(binders, key=lambda item: item["tool_id"].casefold())
 
 
 def list_binder_documents(unit_folder: str | Path, section_folder: str) -> list[Path]:

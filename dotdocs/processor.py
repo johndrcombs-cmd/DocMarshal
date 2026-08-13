@@ -9,8 +9,9 @@ from .assets import asset_folder_root
 from .analysis import classify_document, extract_controlling_date
 from .database import find_asset_owner
 from .matching import match_units_in_text
-from .naming import build_filename, destination_subfolder
+from .naming import build_filename, build_tool_filename, destination_subfolder
 from .normalization import normalize_unit
+from .tools_database import match_tool_in_text
 
 
 def extract_pdf_text(pdf_path: str | Path) -> str:
@@ -51,6 +52,7 @@ def analyze_pdf(
     unit_folders_root: str | Path,
     *,
     farm_asset_folders_root: str | Path | None = None,
+    tool_folders_root: str | Path | None = None,
 ) -> dict:
     pdf_path = Path(pdf_path)
     text = extract_pdf_text(pdf_path)
@@ -60,6 +62,8 @@ def analyze_pdf(
         "status": "needs_review",
         "reasons": [],
         "unit": None,
+        "subject_type": "fleet_unit",
+        "subject_id": None,
         "asset_owner": None,
         "document_type": None,
         "controlling_date": None,
@@ -73,18 +77,27 @@ def analyze_pdf(
         result["reasons"].append("NO_SEARCHABLE_TEXT")
         return result
 
-    match = match_units_in_text(database_path, text)
-    if match["status"] != "unique":
-        result["reasons"].append("UNIT_" + match["status"].upper())
-    else:
-        result["unit"] = match["units"][0]
-        result["asset_owner"] = find_asset_owner(database_path, result["unit"])
-
     document_type = classify_document(text)
     if document_type is None:
         result["reasons"].append("DOCUMENT_TYPE_UNKNOWN")
     else:
         result["document_type"] = document_type
+
+    if document_type == "CAL":
+        result["subject_type"] = "tool"
+        tool_match = match_tool_in_text(database_path, text)
+        if tool_match["status"] != "unique":
+            result["reasons"].append("TOOL_" + tool_match["status"].upper())
+        else:
+            result["subject_id"] = tool_match["tool"]["display_tool_id"]
+    else:
+        match = match_units_in_text(database_path, text)
+        if match["status"] != "unique":
+            result["reasons"].append("UNIT_" + match["status"].upper())
+        else:
+            result["unit"] = match["units"][0]
+            result["subject_id"] = result["unit"]
+            result["asset_owner"] = find_asset_owner(database_path, result["unit"])
 
     controlling_date = extract_controlling_date(text, document_type) if document_type else None
     if controlling_date is None:
@@ -92,16 +105,27 @@ def analyze_pdf(
     else:
         result["controlling_date"] = controlling_date.isoformat()
 
-    selected_root = asset_folder_root(
-        result["asset_owner"], unit_folders_root, farm_asset_folders_root
-    )
-    unit_folder = find_unit_folder(selected_root, result["unit"]) if result["unit"] else None
-    if result["unit"] and unit_folder is None:
-        result["reasons"].append("UNIT_FOLDER_NOT_FOUND")
+    if result["subject_type"] == "tool":
+        tool_folder = Path(tool_folders_root) / f"Tool_{result['subject_id']}" if tool_folders_root and result["subject_id"] else None
+        if result["subject_id"] and (tool_folder is None or not tool_folder.is_dir()):
+            result["reasons"].append("TOOL_FOLDER_NOT_FOUND")
+        subject_folder = tool_folder
+    else:
+        selected_root = asset_folder_root(
+            result["asset_owner"], unit_folders_root, farm_asset_folders_root
+        )
+        unit_folder = find_unit_folder(selected_root, result["unit"]) if result["unit"] else None
+        if result["unit"] and unit_folder is None:
+            result["reasons"].append("UNIT_FOLDER_NOT_FOUND")
+        subject_folder = unit_folder
 
     if not result["reasons"]:
-        filename = build_filename(result["unit"], document_type, controlling_date)
-        destination_folder = unit_folder / destination_subfolder(document_type)
+        filename = (
+            build_tool_filename(result["subject_id"], controlling_date)
+            if result["subject_type"] == "tool"
+            else build_filename(result["unit"], document_type, controlling_date)
+        )
+        destination_folder = subject_folder / destination_subfolder(document_type)
         result["proposed_filename"] = filename
         result["proposed_destination"] = str(destination_folder / filename)
         if (destination_folder / filename).exists():

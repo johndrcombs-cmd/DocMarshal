@@ -15,9 +15,11 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from .assets import ASSET_OWNERS, AssetValidationError, register_manual_asset
 from .binder import (
     BINDER_SECTIONS,
+    TOOL_BINDER_SECTIONS,
     advance_binder_position,
     list_binder_documents,
     list_binders,
+    list_tool_binders,
     render_binder_page,
     render_pdf_page,
 )
@@ -38,9 +40,27 @@ from .document_import import (
     run_pdf_ocr,
 )
 from .naming import DOCUMENT_TYPE_CHOICES
-from .processor import analyze_pdf
+from .processor import analyze_pdf, source_fingerprint
 from .settings import SETTING_DEFINITIONS, save_user_settings
-from .ui_layout import build_application_ui
+from .tool_calibration import calibration_status
+from .tools_database import (
+    add_tool_certification,
+    create_tool,
+    ensure_tools_schema,
+    export_tools_workbook,
+    get_tool,
+    import_tools_workbook,
+    list_tool_certifications,
+    list_tools,
+    update_tool,
+)
+from .ui_layout import (
+    _rounded_rectangle,
+    button_role_visuals,
+    RoundedSurface,
+    build_application_ui,
+    install_rounded_ttk_elements,
+)
 from .review import (
     NON_DOT_DOCUMENT_TYPES,
     ApprovalError,
@@ -62,26 +82,59 @@ APP_ICON_PATH = ASSET_DIR / "docmarshal.ico"
 APP_ICON_PNG_PATH = ASSET_DIR / "docmarshal-icon.png"
 
 DARK_THEME = {
-    "window": "#080D14",
-    "navigation": "#0D141F",
-    "surface": "#111A27",
-    "raised": "#162131",
-    "input": "#1B293A",
+    "window": "#090E17",
+    "navigation": "#0D1420",
+    "surface": "#111B29",
+    "raised": "#172334",
+    "input": "#1B293B",
     "surface_hover": "#22334A",
-    "border": "#2A3B50",
+    "selected": "#203B50",
+    "border": "#223247",
+    "border_quiet": "#182536",
     "border_focus": "#27C2D1",
     "accent": "#F5A814",
     "accent_hover": "#FFB92E",
+    "amber_soft": "#D7A247",
     "cyan": "#27C2D1",
     "teal": "#27D3A2",
     "indigo": "#8B7CF6",
     "magenta": "#D65AD1",
-    "text": "#F3F7FB",
-    "secondary": "#A8B5C5",
-    "muted": "#68778A",
+    "text": "#F2F6FA",
+    "secondary": "#A5B3C4",
+    "muted": "#7F91A9",
     "success": "#28C890",
     "warning": "#F2B84B",
     "danger": "#F06464",
+}
+
+UI_TOKENS = {
+    "font": {
+        "family": "Segoe UI Variable",
+        "fallback": "Segoe UI",
+        "product": 18,
+        "pane_title": 11,
+        "body": 10,
+        "label": 9,
+        "count": 13,
+    },
+    "spacing": {
+        "outer": 8,
+        "region": 10,
+        "pane_gap": 8,
+        "panel_padding": 14,
+        "field_group": 10,
+        "control": 7,
+    },
+    "radius": {
+        "panel": 11,
+        "card": 10,
+        "button": 8,
+        "input": 8,
+        "pill": 18,
+        "dialog": 13,
+    },
+    "elevation": {"toolbar": 1, "panel": 2, "menu": 2, "footer": 2},
+    "motion_ms": {"hover": 140, "focus": 140, "press": 120},
 }
 
 DOCUMENT_TYPE_LABELS = {
@@ -93,9 +146,10 @@ DOCUMENT_TYPE_LABELS = {
     "CAB": "CAB Card",
     "INS": "Insurance",
     "MISC": "Misc",
+    "CAL": "Calibration / Certification",
 }
 
-DISPLAY_ACRONYMS = {"DOT", "PDF", "VIN", "OCR", "ID", "RP", "REG", "INS", "MISC"}
+DISPLAY_ACRONYMS = {"DOT", "PDF", "VIN", "OCR", "ID", "RP", "REG", "INS", "MISC", "CAL"}
 
 
 def next_active_source(
@@ -142,6 +196,7 @@ class DotReviewApp:
         )
         self.unit_root = Path(config["unit_folders_root"])
         self.farm_unit_root = Path(config["farm_asset_folders_root"])
+        self.tool_root = Path(config["tool_folders_root"])
         self.session_path = self.review_folder / "active_review.json"
         self.audit_path = self.review_folder / "audit.jsonl"
         self.events: queue.Queue = queue.Queue()
@@ -302,6 +357,36 @@ class DotReviewApp:
                 return code
         return text.upper()
 
+    @staticmethod
+    def _review_field_labels(document_type: object) -> tuple[str, str]:
+        code = DotReviewApp._document_type_code(document_type)
+        subject_label = "Tool ID" if code == "CAL" else "Unit"
+        date_labels = {
+            "DOT": "Inspection Date",
+            "RP": "Service / Invoice Date",
+            "REG": "Expiration Date",
+            "CAB": "Expiration Date",
+            "INS": "Expiration Date",
+            "TITLE": "Issue Date",
+            "CERTORIGIN": "Issue Date",
+            "MISC": "Document Date",
+            "CAL": "Due / Expiration Date",
+        }
+        return subject_label, date_labels.get(code, "Controlling Date")
+
+    def _sync_review_field_labels(self, *_args) -> None:
+        subject_label, date_label = self._review_field_labels(self.type_var.get())
+        self.subject_field_label_var.set(subject_label)
+        self.date_field_label_var.set(date_label)
+
+    def _on_review_document_type_changed(self, *_args) -> None:
+        previous_subject_label = self.subject_field_label_var.get()
+        subject_label, _date_label = self._review_field_labels(self.type_var.get())
+        if previous_subject_label and previous_subject_label != subject_label:
+            self.unit_var.set("")
+            self.date_var.set("")
+        self._sync_review_field_labels()
+
     def _apply_dark_title_bar(self) -> None:
         if os.name != "nt":
             return
@@ -324,6 +409,10 @@ class DotReviewApp:
         theme = DARK_THEME
         style = ttk.Style(self.root)
         style.theme_use("clam")
+        install_rounded_ttk_elements(self.root, style, theme)
+        style.layout("Primary.TButton", style.layout("PolishPrimary.TButton"))
+        style.layout("Warning.TButton", style.layout("PolishWarning.TButton"))
+        style.layout("Danger.TButton", style.layout("PolishDanger.TButton"))
         self.root.option_add("*Font", "{Segoe UI} 10")
         self.root.option_add("*TCombobox*Listbox.background", theme["input"])
         self.root.option_add("*TCombobox*Listbox.foreground", theme["text"])
@@ -332,21 +421,39 @@ class DotReviewApp:
 
         style.configure("TFrame", background=theme["window"])
         style.configure("Navigation.TFrame", background=theme["navigation"])
-        style.configure(
-            "Glass.TFrame",
-            background=theme["surface"],
-            bordercolor=theme["border"],
-            lightcolor=theme["border"],
-            darkcolor=theme["border"],
-            borderwidth=1,
-            relief="solid",
-        )
+        style.configure("Glass.TFrame", background=theme["surface"], borderwidth=0)
         style.configure("GlassContent.TFrame", background=theme["surface"], borderwidth=0)
+        style.configure("Borderless.TFrame", background=theme["surface"], borderwidth=0)
         style.configure("Raised.TFrame", background=theme["raised"], borderwidth=0)
+        style.configure("Toolbar.TFrame", background=theme["raised"], borderwidth=0)
+        style.configure("ActionBar.TFrame", background=theme["raised"], borderwidth=0)
+        style.configure("StatusBar.TFrame", background=theme["navigation"], borderwidth=0)
+        style.configure("ShortDivider.TFrame", background=theme["border"], borderwidth=0)
         style.configure("TLabel", background=theme["window"], foreground=theme["text"])
         style.configure("Glass.TLabel", background=theme["surface"], foreground=theme["text"])
         style.configure("Raised.TLabel", background=theme["raised"], foreground=theme["text"])
         style.configure("Navigation.TLabel", background=theme["navigation"], foreground=theme["text"])
+        style.configure("StatusBar.TLabel", background=theme["navigation"], foreground=theme["secondary"])
+        style.configure("NavigationMuted.TLabel", background=theme["navigation"], foreground=theme["muted"])
+        style.configure(
+            "ReadyPill.TLabel",
+            background="#123127",
+            foreground=theme["teal"],
+            padding=(10, 5),
+            font=("Segoe UI", 8, "bold"),
+        )
+        style.configure(
+            "PaneTitle.TLabel",
+            background=theme["surface"],
+            foreground=theme["text"],
+            font=("Segoe UI", 11, "bold"),
+        )
+        style.configure(
+            "SectionTitle.TLabel",
+            background=theme["surface"],
+            foreground=theme["secondary"],
+            font=("Segoe UI", 10, "bold"),
+        )
         style.configure(
             "Header.TLabel",
             background=theme["surface"],
@@ -403,9 +510,9 @@ class DotReviewApp:
             fieldbackground=theme["input"],
             foreground=theme["text"],
             insertcolor=theme["text"],
-            bordercolor=theme["border"],
-            lightcolor=theme["border"],
-            darkcolor=theme["border"],
+            bordercolor=theme["border_quiet"],
+            lightcolor=theme["border_quiet"],
+            darkcolor=theme["border_quiet"],
             padding=(8, 5),
         )
         style.map(
@@ -415,14 +522,18 @@ class DotReviewApp:
             darkcolor=[("focus", theme["border_focus"])],
         )
         style.configure(
+            "Rounded.TEntry", fieldbackground=theme["input"], foreground=theme["text"],
+            insertcolor=theme["text"], padding=(9, 6), borderwidth=0,
+        )
+        style.configure(
             "TCombobox",
             fieldbackground=theme["input"],
             background=theme["input"],
             foreground=theme["text"],
             arrowcolor=theme["muted"],
-            bordercolor=theme["border"],
-            lightcolor=theme["border"],
-            darkcolor=theme["border"],
+            bordercolor=theme["border_quiet"],
+            lightcolor=theme["border_quiet"],
+            darkcolor=theme["border_quiet"],
             padding=(7, 5),
         )
         style.map(
@@ -431,6 +542,10 @@ class DotReviewApp:
             foreground=[("readonly", theme["text"]), ("focus", theme["text"])],
             bordercolor=[("focus", theme["border_focus"])],
             arrowcolor=[("active", theme["text"])],
+        )
+        style.configure(
+            "Rounded.TCombobox", fieldbackground=theme["input"], background=theme["input"],
+            foreground=theme["text"], arrowcolor=theme["muted"], padding=(9, 6), borderwidth=0,
         )
 
         style.configure(
@@ -471,33 +586,76 @@ class DotReviewApp:
         style.configure("Danger.TButton", foreground="#FF9B96")
         style.map("Danger.TButton", bordercolor=[("active", theme["danger"]), ("focus", theme["danger"])])
 
+        role_foregrounds = {
+            "primary": theme["text"],
+            "secondary": theme["text"],
+            "utility": theme["secondary"],
+            "warning": theme["warning"],
+            "danger": theme["danger"],
+        }
+        for role, (normal, hover, _pressed, border) in button_role_visuals(theme).items():
+            if role == "main":
+                continue
+            style_name = f"Polish{role.title()}.TButton"
+            foreground = role_foregrounds[role]
+            style.configure(
+                style_name,
+                background=normal,
+                foreground=foreground,
+                bordercolor=border,
+                lightcolor=normal,
+                darkcolor=normal,
+                focusthickness=2,
+                focuscolor=theme["border_focus"],
+                font=("Segoe UI", 9, "bold" if "Primary" in style_name or "Secondary" in style_name else "normal"),
+            )
+            style.map(
+                style_name,
+                background=[("pressed", theme["input"]), ("active", hover), ("disabled", theme["surface"])],
+                foreground=[("disabled", theme["muted"])],
+                bordercolor=[("focus", theme["border_focus"]), ("disabled", theme["surface"])],
+                lightcolor=[("pressed", theme["input"]), ("active", hover), ("disabled", theme["surface"])],
+                darkcolor=[("pressed", theme["input"]), ("active", hover), ("disabled", theme["surface"])],
+            )
+
+        for style_name, foreground in (
+            ("Segment.TButton", theme["muted"]),
+            ("Selected.Segment.TButton", theme["text"]),
+        ):
+            style.configure(
+                style_name, foreground=foreground, padding=(17, 7),
+                font=("Segoe UI", 9, "bold"), borderwidth=0,
+            )
+            style.map(style_name, foreground=[("active", theme["text"]), ("focus", theme["text"])])
+
         style.configure(
-            "Treeview",
+            "Modern.Treeview",
             background=theme["input"],
             fieldbackground=theme["input"],
             foreground=theme["text"],
-            bordercolor=theme["border"],
-            lightcolor=theme["border"],
-            darkcolor=theme["border"],
+            bordercolor=theme["input"],
+            lightcolor=theme["input"],
+            darkcolor=theme["input"],
+            borderwidth=0,
             rowheight=34,
             font=("Segoe UI", 9),
         )
         style.map(
-            "Treeview",
-            background=[("selected", theme["surface_hover"])],
+            "Modern.Treeview",
+            background=[("selected", theme["selected"])],
             foreground=[("selected", theme["text"])],
         )
         style.configure(
-            "Treeview.Heading",
+            "Modern.Treeview.Heading",
             background=theme["surface_hover"],
             foreground=theme["text"],
-            bordercolor=theme["border"],
-            lightcolor=theme["border"],
-            darkcolor=theme["border"],
+            bordercolor=theme["surface_hover"],
+            lightcolor=theme["surface_hover"],
+            darkcolor=theme["surface_hover"],
             padding=(8, 8),
             font=("Segoe UI", 9, "bold"),
         )
-        style.map("Treeview.Heading", background=[("active", theme["border"])])
+        style.map("Modern.Treeview.Heading", background=[("active", theme["raised"])])
         style.configure("TProgressbar", troughcolor=theme["input"], background=theme["accent"], bordercolor=theme["border"])
         for scrollbar_style in ("TScrollbar", "Vertical.TScrollbar", "Horizontal.TScrollbar"):
             style.configure(
@@ -513,18 +671,25 @@ class DotReviewApp:
                 scrollbar_style,
                 background=[("active", theme["border"]), ("pressed", theme["accent"])],
             )
-        style.configure("TPanedwindow", background=theme["window"], sashwidth=6)
+        style.configure("Thin.Vertical.TScrollbar", width=8, arrowsize=0, borderwidth=0)
+        style.configure("Thin.Horizontal.TScrollbar", width=8, arrowsize=0, borderwidth=0)
+        style.configure("TPanedwindow", background=theme["window"], sashwidth=8)
         style.configure(
             "TNotebook",
             background=theme["navigation"],
             bordercolor=theme["navigation"],
             tabmargins=(0, 0, 0, 0),
         )
+        style.configure("Polished.TNotebook", background=theme["window"], borderwidth=0, tabmargins=0)
+        style.layout("Polished.TNotebook", [("Notebook.client", {"sticky": "nsew"})])
+        style.layout("Polished.TNotebook.Tab", [])
         style.configure(
             "TNotebook.Tab",
             background=theme["navigation"],
             foreground=theme["muted"],
             bordercolor=theme["navigation"],
+            lightcolor=theme["navigation"],
+            darkcolor=theme["navigation"],
             padding=(22, 8),
             font=("Segoe UI", 10, "bold"),
         )
@@ -533,6 +698,8 @@ class DotReviewApp:
             background=[("selected", theme["raised"]), ("active", theme["surface_hover"])],
             foreground=[("selected", theme["text"]), ("active", theme["text"])],
             bordercolor=[("selected", theme["cyan"])],
+            lightcolor=[("selected", theme["raised"]), ("active", theme["surface_hover"])],
+            darkcolor=[("selected", theme["raised"]), ("active", theme["surface_hover"])],
         )
         return style
 
@@ -576,33 +743,57 @@ class DotReviewApp:
             self._refresh_binder_shelf()
 
     def _build_database_tab(self) -> None:
-        toolbar = ttk.Frame(self.database_tab, style="Glass.TFrame", padding=(10, 8))
-        toolbar.pack(fill="x", padx=12, pady=(10, 6))
+        selector = ttk.Frame(self.database_tab, style="Navigation.TFrame", padding=(8, 6))
+        selector.pack(fill="x", padx=12, pady=(10, 0))
+        self.database_fleet_frame = ttk.Frame(self.database_tab)
+        self.database_tools_frame = ttk.Frame(self.database_tab)
+        self.database_fleet_view_button = ttk.Button(
+            selector, text="Fleet Assets", style="Selected.Segment.TButton",
+            command=lambda: self._show_database_view("fleet"),
+        )
+        self.database_fleet_view_button.pack(side="left", padx=(0, 4))
+        self.database_tools_view_button = ttk.Button(
+            selector, text="Tools & Calibration", style="Segment.TButton",
+            command=lambda: self._show_database_view("tools"),
+        )
+        self.database_tools_view_button.pack(side="left")
+        self.database_fleet_frame.pack(fill="both", expand=True)
+        self.database_toolbar_surface = RoundedSurface(
+            self.database_fleet_frame, theme=DARK_THEME, radius=11, fill=DARK_THEME["raised"], padding=8, elevation=1, auto_height=True,
+        )
+        self.database_toolbar_surface.pack(fill="x", padx=12, pady=(10, 6))
+        toolbar = self.database_toolbar_surface.content
         ttk.Label(toolbar, text="FLEET ASSET DATABASE", style="Field.TLabel").pack(side="left", padx=(0, 14))
         self.database_search_var = tk.StringVar()
-        search = ttk.Entry(toolbar, textvariable=self.database_search_var, width=28)
+        search = ttk.Entry(toolbar, textvariable=self.database_search_var, width=28, style="Rounded.TEntry")
         search.pack(side="left", padx=(8, 10))
         search.bind("<Return>", lambda _event: self._refresh_database_table())
-        ttk.Button(toolbar, text="Search", command=self._refresh_database_table).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="Refresh", command=self._refresh_database_table).pack(side="left", padx=3)
-        ttk.Button(toolbar, text="Add Trackable Field", command=self._add_database_field).pack(side="right", padx=3)
-        ttk.Button(toolbar, text="Export XLSX", command=self._export_database).pack(side="right", padx=3)
-        ttk.Button(toolbar, text="Import XLSX", command=self._import_database).pack(side="right", padx=3)
+        ttk.Button(toolbar, text="Search", command=self._refresh_database_table, style="PolishUtility.TButton").pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Refresh", command=self._refresh_database_table, style="PolishUtility.TButton").pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Add Trackable Field", command=self._add_database_field, style="PolishUtility.TButton").pack(side="right", padx=3)
+        ttk.Button(toolbar, text="Export XLSX", command=self._export_database, style="PolishUtility.TButton").pack(side="right", padx=3)
+        ttk.Button(toolbar, text="Import XLSX", command=self._import_database, style="PolishUtility.TButton").pack(side="right", padx=3)
 
-        pane = ttk.Panedwindow(self.database_tab, orient="vertical")
+        pane = ttk.Panedwindow(self.database_fleet_frame, orient="vertical")
         pane.pack(fill="both", expand=True, padx=12, pady=(0, 6))
-        table_frame = ttk.Frame(pane, style="Glass.TFrame", padding=1)
-        editor = ttk.LabelFrame(
-            pane,
-            text="Edit Selected Asset",
-            style="Glass.TLabelframe",
-            padding=(12, 10),
+        self.database_table_surface = RoundedSurface(
+            pane, theme=DARK_THEME, radius=11, fill=DARK_THEME["input"], padding=6, elevation=2,
         )
-        pane.add(table_frame, weight=4)
-        pane.add(editor, weight=1)
+        table_frame = self.database_table_surface.content
+        self.database_editor_surface = RoundedSurface(
+            pane, theme=DARK_THEME, radius=11, fill=DARK_THEME["surface"], padding=12, elevation=2,
+        )
+        editor = self.database_editor_surface.content
+        pane.add(self.database_table_surface, weight=4)
+        pane.add(self.database_editor_surface, weight=1)
+        ttk.Label(editor, text="Edit Selected Asset", style="PaneTitle.TLabel").grid(
+            row=0, column=0, columnspan=8, sticky="w", pady=(0, 8)
+        )
 
         columns = ("unit", "owner", "type", "year", "make", "model", "plate", "vin", "dot")
-        self.database_table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.database_table = ttk.Treeview(
+            table_frame, columns=columns, show="headings", selectmode="browse", style="Modern.Treeview",
+        )
         headings = {
             "unit": "Unit", "owner": "Ownership", "type": "Unit Type", "year": "Year",
             "make": "Make", "model": "Model", "plate": "Plate / Tag", "vin": "VIN / Serial",
@@ -612,8 +803,8 @@ class DotReviewApp:
         for column in columns:
             self.database_table.heading(column, text=headings[column])
             self.database_table.column(column, width=widths[column], minwidth=widths[column], anchor="w")
-        db_vertical = ttk.Scrollbar(table_frame, orient="vertical", command=self.database_table.yview)
-        db_horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.database_table.xview)
+        db_vertical = ttk.Scrollbar(table_frame, orient="vertical", command=self.database_table.yview, style="Thin.Vertical.TScrollbar")
+        db_horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.database_table.xview, style="Thin.Horizontal.TScrollbar")
         self.database_table.configure(yscrollcommand=db_vertical.set, xscrollcommand=db_horizontal.set)
         self.database_table.grid(row=0, column=0, sticky="nsew")
         db_vertical.grid(row=0, column=1, sticky="ns")
@@ -632,29 +823,302 @@ class DotReviewApp:
         )
         self.database_field_vars = {}
         for index, (field, label) in enumerate(self.database_field_definitions):
-            row = (index // 4) * 2
+            row = (index // 4) * 2 + 1
             column = (index % 4) * 2
             ttk.Label(editor, text=label, style="Field.TLabel").grid(row=row, column=column, sticky="w", padx=(0, 6), pady=(0, 2))
             variable = tk.StringVar()
             self.database_field_vars[field] = variable
             if field == "asset_owner":
-                widget = ttk.Combobox(editor, textvariable=variable, values=("", *ASSET_OWNERS), state="readonly", width=20)
+                widget = ttk.Combobox(editor, textvariable=variable, values=("", *ASSET_OWNERS), state="readonly", width=20, style="Rounded.TCombobox")
             else:
-                widget = ttk.Entry(editor, textvariable=variable, width=22)
+                widget = ttk.Entry(editor, textvariable=variable, width=22, style="Rounded.TEntry")
             widget.grid(row=row + 1, column=column, columnspan=2, sticky="ew", padx=(0, 12), pady=(0, 7))
         for column in range(8):
             editor.columnconfigure(column, weight=1)
         self.database_custom_frame = ttk.Frame(editor, style="GlassContent.TFrame")
-        self.database_custom_frame.grid(row=6, column=0, columnspan=8, sticky="ew", pady=(2, 0))
+        self.database_custom_frame.grid(row=7, column=0, columnspan=8, sticky="ew", pady=(2, 0))
         self.database_custom_vars: dict[int, tk.StringVar] = {}
         actions = ttk.Frame(editor, style="GlassContent.TFrame")
-        actions.grid(row=8, column=0, columnspan=8, sticky="e", pady=(8, 0))
+        actions.grid(row=9, column=0, columnspan=8, sticky="e", pady=(8, 0))
         ttk.Button(actions, text="Save Asset Updates", command=self._save_database_record, style="Primary.TButton").pack(side="left")
         self.database_status_var = tk.StringVar(value="Select an asset to view or edit its database record.")
-        ttk.Label(self.database_tab, textvariable=self.database_status_var, style="Status.TLabel", anchor="w").pack(
+        ttk.Label(self.database_fleet_frame, textvariable=self.database_status_var, style="Status.TLabel", anchor="w").pack(
             side="bottom", fill="x", padx=12, pady=(0, 8), before=pane
         )
         self.database_rows: dict[str, int] = {}
+        self._build_tools_database_view()
+
+    def _show_database_view(self, view: str) -> None:
+        self.database_fleet_frame.pack_forget()
+        self.database_tools_frame.pack_forget()
+        self.database_fleet_view_button.configure(style="Selected.Segment.TButton" if view == "fleet" else "Segment.TButton")
+        self.database_tools_view_button.configure(style="Selected.Segment.TButton" if view == "tools" else "Segment.TButton")
+        if view == "tools":
+            self.database_tools_frame.pack(fill="both", expand=True)
+            self._refresh_tools_table()
+        else:
+            self.database_fleet_frame.pack(fill="both", expand=True)
+            self._refresh_database_table()
+
+    def _build_tools_database_view(self) -> None:
+        toolbar = ttk.Frame(self.database_tools_frame, style="Toolbar.TFrame", padding=(10, 8))
+        toolbar.pack(fill="x", padx=12, pady=(6, 6))
+        ttk.Label(toolbar, text="TOOLS & CALIBRATION", style="Field.TLabel").pack(side="left")
+        self.tools_search_var = tk.StringVar()
+        search = ttk.Entry(toolbar, textvariable=self.tools_search_var, width=28, style="Rounded.TEntry")
+        search.pack(side="left", padx=(14, 6))
+        search.bind("<Return>", lambda _event: self._refresh_tools_table())
+        ttk.Button(toolbar, text="Search", command=self._refresh_tools_table, style="PolishUtility.TButton").pack(side="left", padx=3)
+        ttk.Button(toolbar, text="Add Tool", command=self._add_tool_record, style="PolishSecondary.TButton").pack(side="right", padx=3)
+        ttk.Button(toolbar, text="Export XLSX", command=self._export_tools_database, style="PolishUtility.TButton").pack(side="right", padx=3)
+        ttk.Button(toolbar, text="Import XLSX", command=self._import_tools_database, style="PolishUtility.TButton").pack(side="right", padx=3)
+
+        summary = ttk.Frame(self.database_tools_frame)
+        summary.pack(fill="x", padx=12, pady=(0, 6))
+        self.tool_status_vars = {}
+        for code, label, color in (
+            ("current", "Current", DARK_THEME["success"]),
+            ("due_soon", "Due Soon", DARK_THEME["warning"]),
+            ("expired", "Expired", DARK_THEME["danger"]),
+            ("no_date", "No Date", DARK_THEME["muted"]),
+            ("failed", "Failed", DARK_THEME["danger"]),
+        ):
+            variable = tk.StringVar(value=f"{label}: 0")
+            self.tool_status_vars[code] = variable
+            ttk.Label(summary, textvariable=variable, style="Raised.TLabel", foreground=color, padding=(12, 7)).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        pane = ttk.Panedwindow(self.database_tools_frame, orient="vertical")
+        pane.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        table_frame = ttk.Frame(pane, style="Glass.TFrame", padding=6)
+        editor = ttk.Frame(pane, style="Glass.TFrame", padding=12)
+        pane.add(table_frame, weight=2)
+        pane.add(editor, weight=3)
+        columns = ("id", "description", "category", "maker", "model", "serial", "location", "due", "status")
+        self.tools_table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse", style="Modern.Treeview")
+        headings = {"id": "Tool ID", "description": "Description", "category": "Category", "maker": "Manufacturer", "model": "Model", "serial": "Serial Number", "location": "Location", "due": "Due / Expires", "status": "Status"}
+        widths = {"id": 95, "description": 190, "category": 100, "maker": 110, "model": 100, "serial": 120, "location": 110, "due": 105, "status": 105}
+        for column in columns:
+            self.tools_table.heading(column, text=headings[column])
+            self.tools_table.column(column, width=widths[column], minwidth=70, anchor="w")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tools_table.yview, style="Thin.Vertical.TScrollbar")
+        self.tools_table.configure(yscrollcommand=scroll.set)
+        self.tools_table.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.tools_table.bind("<<TreeviewSelect>>", self._on_tool_selection)
+        for code, color in (("current", DARK_THEME["success"]), ("due_soon", DARK_THEME["warning"]), ("expired", DARK_THEME["danger"]), ("no_date", DARK_THEME["muted"]), ("failed", DARK_THEME["danger"])):
+            self.tools_table.tag_configure(code, foreground=color)
+
+        details = ttk.Frame(editor, style="GlassContent.TFrame")
+        details.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        history = ttk.Frame(editor, style="GlassContent.TFrame")
+        history.pack(side="left", fill="both", expand=True)
+        ttk.Label(details, text="Tool Details", style="PaneTitle.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 7))
+        fields = (
+            ("tool_id", "Tool ID"), ("description", "Description"), ("category", "Category"),
+            ("manufacturer", "Manufacturer"), ("model", "Model"), ("serial_number", "Serial Number"),
+            ("location", "Location"), ("custodian", "Custodian"),
+            ("calibration_interval_months", "Interval Months"), ("notes", "Notes"),
+        )
+        self.tool_field_vars = {}
+        for index, (field, label) in enumerate(fields):
+            row, column = (index // 2) * 2 + 1, (index % 2) * 2
+            ttk.Label(details, text=label, style="Field.TLabel").grid(row=row, column=column, columnspan=2, sticky="w")
+            variable = tk.StringVar()
+            self.tool_field_vars[field] = variable
+            ttk.Entry(details, textvariable=variable, style="Rounded.TEntry").grid(row=row + 1, column=column, columnspan=2, sticky="ew", padx=(0, 8), pady=(2, 5))
+        self.tool_required_var = tk.BooleanVar(value=True)
+        self.tool_active_var = tk.BooleanVar(value=True)
+        checks = ttk.Frame(details, style="GlassContent.TFrame")
+        checks.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(5, 0))
+        ttk.Checkbutton(checks, text="Calibration required", variable=self.tool_required_var).pack(side="left")
+        ttk.Checkbutton(checks, text="Active", variable=self.tool_active_var).pack(side="left", padx=12)
+        ttk.Button(checks, text="Save Tool", command=self._save_tool_record, style="PolishPrimary.TButton").pack(side="right")
+        for column in range(4):
+            details.columnconfigure(column, weight=1)
+
+        header = ttk.Frame(history, style="GlassContent.TFrame")
+        header.pack(fill="x", pady=(0, 7))
+        ttk.Label(header, text="Calibration / Certification History", style="PaneTitle.TLabel").pack(side="left")
+        ttk.Button(header, text="Add Record", command=self._add_tool_certification, style="PolishSecondary.TButton").pack(side="right")
+        history_columns = ("type", "performed", "due", "result", "provider")
+        self.tool_history_table = ttk.Treeview(history, columns=history_columns, show="headings", style="Modern.Treeview")
+        for column, label, width in (("type", "Type", 95), ("performed", "Performed", 90), ("due", "Due", 90), ("result", "Result", 75), ("provider", "Provider", 130)):
+            self.tool_history_table.heading(column, text=label)
+            self.tool_history_table.column(column, width=width, anchor="w")
+        self.tool_history_table.pack(fill="both", expand=True)
+        self.tools_rows = {}
+        self.active_tool_id = None
+        self.tools_status_var = tk.StringVar(value="No tool records loaded.")
+        ttk.Label(self.database_tools_frame, textvariable=self.tools_status_var, style="Status.TLabel").pack(fill="x", padx=12, pady=(0, 8))
+
+    def _tool_status(self, tool_id: int):
+        history = list_tool_certifications(self.database, tool_id)
+        if not history:
+            return calibration_status(None)
+        latest = history[0]
+        return calibration_status(latest.get("due_date"), result=latest.get("result"))
+
+    def _refresh_tools_table(self) -> None:
+        if not hasattr(self, "tools_table"):
+            return
+        self.tools_table.delete(*self.tools_table.get_children())
+        self.tools_rows.clear()
+        try:
+            ensure_tools_schema(self.database)
+            tools = list_tools(self.database, self.tools_search_var.get())
+            counts = {code: 0 for code in self.tool_status_vars}
+            for tool in tools:
+                status = self._tool_status(tool["id"])
+                counts[status.code] += 1
+                history = list_tool_certifications(self.database, tool["id"])
+                due = history[0].get("due_date") if history else ""
+                item_id = f"tool-{tool['id']}"
+                self.tools_table.insert(
+                    "", "end", iid=item_id, tags=(status.code,),
+                    values=(
+                        tool["display_tool_id"], tool["description"], tool["category"],
+                        tool["manufacturer"], tool["model"], tool["serial_number"], tool["location"],
+                        due or "—", status.label if tool["active"] else "Inactive",
+                    ),
+                )
+                self.tools_rows[item_id] = tool["id"]
+            labels = {"current": "Current", "due_soon": "Due Soon", "expired": "Expired", "no_date": "No Date", "failed": "Failed"}
+            for code, variable in self.tool_status_vars.items():
+                variable.set(f"{labels[code]}: {counts[code]}")
+            self.tools_status_var.set(f"{len(tools)} tool record(s). Select one to edit or review calibration history.")
+        except Exception as error:
+            self.tools_status_var.set(f"Tools database unavailable: {error}")
+
+    def _selected_tool_id(self) -> int | None:
+        selected = self.tools_table.selection()
+        return self.tools_rows.get(selected[0]) if selected else None
+
+    def _on_tool_selection(self, _event=None) -> None:
+        tool_id = self._selected_tool_id()
+        if tool_id is None:
+            return
+        try:
+            tool = get_tool(self.database, tool_id)
+            history = list_tool_certifications(self.database, tool_id)
+        except Exception as error:
+            self.tools_status_var.set(f"Tool could not be loaded: {error}")
+            return
+        self.active_tool_id = tool_id
+        for field, variable in self.tool_field_vars.items():
+            key = "display_tool_id" if field == "tool_id" else field
+            variable.set(tool.get(key) if tool.get(key) is not None else "")
+        self.tool_required_var.set(tool["calibration_required"])
+        self.tool_active_var.set(tool["active"])
+        self.tool_history_table.delete(*self.tool_history_table.get_children())
+        for item in history:
+            self.tool_history_table.insert(
+                "", "end", values=(item["certificate_type"], item["performed_date"] or "—", item["due_date"] or "—", item["result"].title(), item["provider"]),
+            )
+        status = self._tool_status(tool_id)
+        self.tools_status_var.set(f"{tool['display_tool_id']} • {status.message}")
+
+    def _new_tool_record(self) -> None:
+        self.active_tool_id = None
+        self.tools_table.selection_remove(self.tools_table.selection())
+        for variable in self.tool_field_vars.values():
+            variable.set("")
+        self.tool_required_var.set(True)
+        self.tool_active_var.set(True)
+        self.tool_history_table.delete(*self.tool_history_table.get_children())
+        self.tools_status_var.set("Enter the new tool details, then select Save Tool.")
+
+    def _add_tool_record(self) -> None:
+        has_new_details = self.active_tool_id is None and any(
+            str(variable.get() or "").strip() for variable in self.tool_field_vars.values()
+        )
+        if has_new_details:
+            self._save_tool_record()
+        else:
+            self._new_tool_record()
+
+    def _save_tool_record(self) -> None:
+        values = {field: variable.get() for field, variable in self.tool_field_vars.items()}
+        values["calibration_required"] = self.tool_required_var.get()
+        values["active"] = self.tool_active_var.get()
+        try:
+            if self.active_tool_id is None:
+                tool = create_tool(self.database, values)
+            else:
+                tool = update_tool(self.database, self.active_tool_id, values)
+        except Exception as error:
+            messagebox.showerror("Tool not saved", str(error), parent=self.root)
+            return
+        self.active_tool_id = tool["id"]
+        self._refresh_tools_table()
+        item_id = f"tool-{tool['id']}"
+        if self.tools_table.exists(item_id):
+            self.tools_table.selection_set(item_id)
+            self.tools_table.see(item_id)
+            self._on_tool_selection()
+        self.tools_status_var.set(f"Saved tool {tool['display_tool_id']}.")
+
+    def _add_tool_certification(self) -> None:
+        tool_id = self._selected_tool_id() or self.active_tool_id
+        if tool_id is None:
+            messagebox.showinfo("Select a tool", "Select a tool before adding calibration history.", parent=self.root)
+            return
+        certificate_type = simpledialog.askstring("Calibration Record", "Type: Calibration or Certification", initialvalue="Calibration", parent=self.root)
+        if not certificate_type:
+            return
+        performed = simpledialog.askstring("Calibration Record", "Performed date (YYYY-MM-DD):", parent=self.root)
+        if performed is None:
+            return
+        due = simpledialog.askstring("Calibration Record", "Due / expiration date (YYYY-MM-DD):", parent=self.root)
+        if due is None:
+            return
+        result = simpledialog.askstring("Calibration Record", "Result: pass, fail, limited, or unknown", initialvalue="pass", parent=self.root)
+        if not result:
+            return
+        provider = simpledialog.askstring("Calibration Record", "Calibration provider (optional):", parent=self.root)
+        if provider is None:
+            return
+        try:
+            add_tool_certification(
+                self.database, tool_id,
+                {"certificate_type": certificate_type, "performed_date": performed, "due_date": due, "result": result, "provider": provider},
+            )
+        except Exception as error:
+            messagebox.showerror("Calibration record not added", str(error), parent=self.root)
+            return
+        self._refresh_tools_table()
+        item_id = f"tool-{tool_id}"
+        if self.tools_table.exists(item_id):
+            self.tools_table.selection_set(item_id)
+            self._on_tool_selection()
+
+    def _import_tools_database(self) -> None:
+        path = filedialog.askopenfilename(title="Import Tools & Calibration", filetypes=(("Excel workbook", "*.xlsx"),), parent=self.root)
+        if not path:
+            return
+        try:
+            summary = import_tools_workbook(path, self.database)
+        except Exception as error:
+            messagebox.showerror("Tools import cancelled", str(error), parent=self.root)
+            return
+        self._refresh_tools_table()
+        self.tools_status_var.set(f"Tools import complete: {summary['updated']} updated, {summary['inserted']} added.")
+
+    def _export_tools_database(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Export Tools & Calibration", defaultextension=".xlsx",
+            filetypes=(("Excel workbook", "*.xlsx"),),
+            initialfile=f"DocMarshal-Tools-{datetime.now():%Y-%m-%d}.xlsx", parent=self.root,
+        )
+        if not path:
+            return
+        try:
+            export_tools_workbook(self.database, path)
+        except Exception as error:
+            messagebox.showerror("Tools export failed", str(error), parent=self.root)
+            return
+        self.tools_status_var.set(f"Tools and certification history exported to {path}")
 
     def _refresh_database_table(self) -> None:
         if not hasattr(self, "database_table"):
@@ -702,7 +1166,7 @@ class DotReviewApp:
             ttk.Label(self.database_custom_frame, text=label, style="Field.TLabel").grid(row=row, column=column, sticky="w", padx=(0, 6))
             variable = tk.StringVar(value=record["custom_values"].get(field["id"], ""))
             self.database_custom_vars[field["id"]] = variable
-            ttk.Entry(self.database_custom_frame, textvariable=variable).grid(
+            ttk.Entry(self.database_custom_frame, textvariable=variable, style="Rounded.TEntry").grid(
                 row=row + 1, column=column, columnspan=2, sticky="ew", padx=(0, 12), pady=(0, 6)
             )
         for column in range(8):
@@ -796,8 +1260,11 @@ class DotReviewApp:
         self.database_status_var.set(f"Complete database exported to {path}")
 
     def _build_settings_tab(self) -> None:
-        heading = ttk.Frame(self.settings_tab, style="Glass.TFrame", padding=(14, 10))
-        heading.pack(fill="x", padx=12, pady=(10, 6))
+        self.settings_heading_surface = RoundedSurface(
+            self.settings_tab, theme=DARK_THEME, radius=11, fill=DARK_THEME["raised"], padding=12, elevation=1, auto_height=True,
+        )
+        self.settings_heading_surface.pack(fill="x", padx=12, pady=(10, 6))
+        heading = self.settings_heading_surface.content
         ttk.Label(
             heading,
             text="INSTALLATION SETTINGS",
@@ -806,18 +1273,26 @@ class DotReviewApp:
         ttk.Label(
             heading,
             text="Local paths for document intake, processing data, and virtual binders. Changes apply after restart.",
-            style="Glass.TLabel",
+            style="Raised.TLabel",
         ).pack(anchor="w", pady=(3, 0))
         groups = ttk.Frame(self.settings_tab)
         groups.pack(fill="both", expand=True, padx=12, pady=(0, 6))
-        processing_panel = ttk.LabelFrame(
-            groups, text="Document Processing", style="Glass.TLabelframe", padding=(14, 10)
+        self.settings_processing_surface = RoundedSurface(
+            groups, theme=DARK_THEME, radius=11, fill=DARK_THEME["surface"], padding=14, elevation=2,
         )
-        processing_panel.pack(side="left", fill="both", expand=True, padx=(0, 3))
-        binder_panel = ttk.LabelFrame(
-            groups, text="Assets and Virtual Binders", style="Glass.TLabelframe", padding=(14, 10)
+        self.settings_processing_surface.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        processing_panel = self.settings_processing_surface.content
+        self.settings_binder_surface = RoundedSurface(
+            groups, theme=DARK_THEME, radius=11, fill=DARK_THEME["surface"], padding=14, elevation=2,
         )
-        binder_panel.pack(side="left", fill="both", expand=True, padx=(3, 0))
+        self.settings_binder_surface.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        binder_panel = self.settings_binder_surface.content
+        ttk.Label(processing_panel, text="Document Processing", style="PaneTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 9)
+        )
+        ttk.Label(binder_panel, text="Assets and Virtual Binders", style="PaneTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 9)
+        )
         self.settings_vars = {}
         processing_keys = {"scan_incoming", "scan_processed", "scan_approved", "scan_exceptions", "scan_review"}
         group_rows = {"processing": 0, "binder": 0}
@@ -828,19 +1303,23 @@ class DotReviewApp:
             variable = tk.StringVar(value=str(self.config.get(definition["key"], "")))
             self.settings_vars[definition["key"]] = variable
             ttk.Label(panel, text=definition["label"], style="Field.TLabel").grid(
-                row=row * 2, column=0, columnspan=2, sticky="w", pady=(3, 2)
+                row=row * 2 + 1, column=0, columnspan=2, sticky="w", pady=(3, 2)
             )
-            ttk.Entry(panel, textvariable=variable).grid(row=row * 2 + 1, column=0, sticky="ew", pady=(0, 7))
+            ttk.Entry(panel, textvariable=variable, style="Rounded.TEntry").grid(row=row * 2 + 2, column=0, sticky="ew", pady=(0, 7))
             ttk.Button(
                 panel,
                 text="Browse…",
                 command=lambda item=definition: self._browse_setting(item),
-            ).grid(row=row * 2 + 1, column=1, padx=(8, 0), pady=(0, 7))
+                style="PolishUtility.TButton",
+            ).grid(row=row * 2 + 2, column=1, padx=(8, 0), pady=(0, 7))
             group_rows[group_name] += 1
         processing_panel.columnconfigure(0, weight=1)
         binder_panel.columnconfigure(0, weight=1)
-        settings_footer = ttk.Frame(self.settings_tab, style="Navigation.TFrame", padding=(10, 6))
-        settings_footer.pack(side="bottom", fill="x", padx=12, pady=(0, 8), before=groups)
+        self.settings_footer_surface = RoundedSurface(
+            self.settings_tab, theme=DARK_THEME, radius=11, fill=DARK_THEME["navigation"], padding=8, elevation=2, auto_height=True,
+        )
+        self.settings_footer_surface.pack(side="bottom", fill="x", padx=12, pady=(0, 8), before=groups)
+        settings_footer = self.settings_footer_surface.content
         self.settings_status_var = tk.StringVar(value="Settings are stored locally in config.json and are not published.")
         ttk.Label(settings_footer, textvariable=self.settings_status_var, style="Navigation.TLabel", anchor="w").pack(
             side="left", fill="x", expand=True
@@ -874,47 +1353,77 @@ class DotReviewApp:
     def _build_binder_tab(self) -> None:
         pane = ttk.Panedwindow(self.binder_tab, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=12, pady=(10, 8))
-        shelf = ttk.LabelFrame(pane, text="Asset Binders", style="Glass.TLabelframe", padding=(8, 8))
-        viewer = ttk.LabelFrame(pane, text="Document Viewer", style="Glass.TLabelframe", padding=(10, 10))
-        pane.add(shelf, weight=1)
-        pane.add(viewer, weight=4)
+        self.binder_shelf_surface = RoundedSurface(pane, theme=DARK_THEME, radius=11, fill=DARK_THEME["surface"], padding=10, elevation=2)
+        shelf = self.binder_shelf_surface.content
+        self.binder_viewer_surface = RoundedSurface(pane, theme=DARK_THEME, radius=11, fill=DARK_THEME["surface"], padding=10, elevation=2)
+        viewer = self.binder_viewer_surface.content
+        pane.add(self.binder_shelf_surface, weight=1)
+        pane.add(self.binder_viewer_surface, weight=4)
+        ttk.Label(shelf, text="Virtual Binder Shelves", style="PaneTitle.TLabel").pack(anchor="w", pady=(0, 8))
+        shelf_selector = ttk.Frame(shelf, style="GlassContent.TFrame")
+        shelf_selector.pack(fill="x", pady=(0, 8))
+        self.fleet_binder_button = ttk.Button(
+            shelf_selector, text="Fleet Binders", style="Selected.Segment.TButton",
+            command=lambda: self._set_binder_mode("fleet"),
+        )
+        self.fleet_binder_button.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.tool_binder_button = ttk.Button(
+            shelf_selector, text="Tool Binders", style="Segment.TButton",
+            command=lambda: self._set_binder_mode("tools"),
+        )
+        self.tool_binder_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
+        ttk.Label(viewer, text="Document Viewer", style="PaneTitle.TLabel").pack(anchor="w", pady=(0, 8))
         shelf_toolbar = ttk.Frame(shelf, style="GlassContent.TFrame")
         shelf_toolbar.pack(fill="x", pady=(0, 8))
         self.binder_filter_var = tk.StringVar()
-        binder_filter = ttk.Entry(shelf_toolbar, textvariable=self.binder_filter_var, width=12)
+        binder_filter = ttk.Entry(shelf_toolbar, textvariable=self.binder_filter_var, width=12, style="Rounded.TEntry")
         binder_filter.pack(side="left", fill="x", expand=True)
         binder_filter.bind("<Return>", lambda _event: self._refresh_binder_shelf())
-        ttk.Button(shelf_toolbar, text="Find Unit", command=self._refresh_binder_shelf).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            shelf_toolbar, text="Find", command=self._refresh_binder_shelf,
+            style="PolishUtility.TButton",
+        ).pack(side="left", padx=(6, 0))
         shelf_frame = ttk.Frame(shelf, style="GlassContent.TFrame")
         shelf_frame.pack(fill="both", expand=True)
         self.binder_shelf = tk.Canvas(
             shelf_frame,
             width=230,
             background=DARK_THEME["input"],
-            highlightbackground=DARK_THEME["border"],
-            highlightthickness=1,
+            highlightthickness=0,
         )
-        shelf_scroll = ttk.Scrollbar(shelf_frame, orient="vertical", command=self.binder_shelf.yview)
+        shelf_scroll = ttk.Scrollbar(shelf_frame, orient="vertical", command=self.binder_shelf.yview, style="Thin.Vertical.TScrollbar")
         self.binder_shelf.configure(yscrollcommand=shelf_scroll.set)
         self._bind_canvas_mouse_wheel(self.binder_shelf)
         self.binder_shelf.pack(side="left", fill="both", expand=True)
         shelf_scroll.pack(side="right", fill="y")
         self.binder_shelf.bind("<Button-1>", self._select_binder_from_shelf)
+        self.binder_shelf.bind("<Motion>", self._hover_binder_shelf)
+        self.binder_shelf.bind("<Leave>", self._leave_binder_shelf)
+        self._binder_hover_index = None
+        self._binder_selected_index = None
+        self._binder_selected_identity = None
 
         self.binder_title_var = tk.StringVar(value="Select a binder from the shelf")
         ttk.Label(viewer, textvariable=self.binder_title_var, style="Header.TLabel").pack(anchor="w", pady=(0, 8))
-        document_bar = ttk.Frame(viewer, style="GlassContent.TFrame")
-        document_bar.pack(fill="x", pady=(0, 8))
+        self.binder_toolbar_surface = RoundedSurface(viewer, theme=DARK_THEME, radius=10, fill=DARK_THEME["raised"], padding=7, elevation=1, auto_height=True)
+        self.binder_toolbar_surface.pack(fill="x", pady=(0, 8))
+        document_bar = self.binder_toolbar_surface.content
         ttk.Label(document_bar, text="Document", style="Field.TLabel").pack(side="left")
         self.binder_document_var = tk.StringVar()
-        self.binder_document_box = ttk.Combobox(document_bar, textvariable=self.binder_document_var, state="readonly")
+        self.binder_document_box = ttk.Combobox(document_bar, textvariable=self.binder_document_var, state="readonly", style="Rounded.TCombobox")
         self.binder_document_box.pack(side="left", fill="x", expand=True, padx=(8, 0))
         self.binder_document_box.bind("<<ComboboxSelected>>", lambda _event: self._select_binder_document())
-        ttk.Button(document_bar, text="Zoom Out", command=lambda: self._change_binder_zoom(-0.25)).pack(side="left", padx=(10, 3))
+        ttk.Button(
+            document_bar, text="Zoom Out", command=lambda: self._change_binder_zoom(-0.25),
+            style="PolishUtility.TButton",
+        ).pack(side="left", padx=(10, 3))
         self.binder_zoom_var = tk.StringVar(value="100%")
         ttk.Label(document_bar, textvariable=self.binder_zoom_var, style="Glass.TLabel", width=6, anchor="center").pack(side="left")
-        ttk.Button(document_bar, text="Fit Page", command=self._fit_binder_page).pack(side="left", padx=3)
-        ttk.Button(document_bar, text="Zoom In", command=lambda: self._change_binder_zoom(0.25)).pack(side="left", padx=3)
+        ttk.Button(document_bar, text="Fit Page", command=self._fit_binder_page, style="PolishUtility.TButton").pack(side="left", padx=3)
+        ttk.Button(
+            document_bar, text="Zoom In", command=lambda: self._change_binder_zoom(0.25),
+            style="PolishUtility.TButton",
+        ).pack(side="left", padx=3)
 
         page_area = ttk.Frame(viewer, style="GlassContent.TFrame")
         page_area.pack(fill="both", expand=True)
@@ -923,11 +1432,10 @@ class DotReviewApp:
         self.binder_page_canvas = tk.Canvas(
             canvas_frame,
             background=DARK_THEME["input"],
-            highlightbackground=DARK_THEME["border"],
-            highlightthickness=1,
+            highlightthickness=0,
         )
-        binder_vertical = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.binder_page_canvas.yview)
-        binder_horizontal = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.binder_page_canvas.xview)
+        binder_vertical = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.binder_page_canvas.yview, style="Thin.Vertical.TScrollbar")
+        binder_horizontal = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.binder_page_canvas.xview, style="Thin.Horizontal.TScrollbar")
         self.binder_page_canvas.configure(
             yscrollcommand=binder_vertical.set,
             xscrollcommand=binder_horizontal.set,
@@ -942,17 +1450,27 @@ class DotReviewApp:
         tabs = ttk.Frame(page_area, style="GlassContent.TFrame")
         tabs.pack(side="right", fill="y", padx=(10, 0))
         self.binder_section_buttons = []
+        self.binder_tabs_frame = tabs
         for label, folder in BINDER_SECTIONS:
-            button = ttk.Button(tabs, text=label, command=lambda selected=folder: self._open_binder_section(selected))
+            button = ttk.Button(
+                tabs, text=label, command=lambda selected=folder: self._open_binder_section(selected),
+                style="PolishUtility.TButton",
+            )
             button.pack(fill="x", pady=(0, 8))
             self.binder_section_buttons.append(button)
 
         navigation = ttk.Frame(viewer, style="GlassContent.TFrame")
         navigation.pack(fill="x", pady=(8, 0))
-        ttk.Button(navigation, text="‹ Previous Page", command=lambda: self._turn_binder_page(-1)).pack(side="left")
+        ttk.Button(
+            navigation, text="‹ Previous Page", command=lambda: self._turn_binder_page(-1),
+            style="PolishUtility.TButton",
+        ).pack(side="left")
         self.binder_page_status_var = tk.StringVar(value="No document selected")
         ttk.Label(navigation, textvariable=self.binder_page_status_var, style="Glass.TLabel").pack(side="left", expand=True)
-        ttk.Button(navigation, text="Next Page ›", command=lambda: self._turn_binder_page(1)).pack(side="right")
+        ttk.Button(
+            navigation, text="Next Page ›", command=lambda: self._turn_binder_page(1),
+            style="PolishUtility.TButton",
+        ).pack(side="right")
         self.binder_records: list[dict] = []
         self.active_binder: dict | None = None
         self.active_binder_section: str | None = None
@@ -962,55 +1480,154 @@ class DotReviewApp:
         self.binder_page_count = 0
         self.binder_page_image = None
         self.binder_zoom_factor = 1.0
+        self.binder_mode = "fleet"
+
+    def _binder_sections(self):
+        return TOOL_BINDER_SECTIONS if getattr(self, "binder_mode", "fleet") == "tools" else BINDER_SECTIONS
+
+    def _set_binder_mode(self, mode: str) -> None:
+        self.binder_mode = mode
+        self.fleet_binder_button.configure(style="Selected.Segment.TButton" if mode == "fleet" else "Segment.TButton")
+        self.tool_binder_button.configure(style="Selected.Segment.TButton" if mode == "tools" else "Segment.TButton")
+        self._binder_selected_identity = None
+        self._binder_selected_index = None
+        self.active_binder = None
+        self.active_binder_section = None
+        self.binder_document_box.configure(values=())
+        self.binder_document_var.set("")
+        for button in self.binder_section_buttons:
+            button.destroy()
+        self.binder_section_buttons = []
+        for label, folder in self._binder_sections():
+            button = ttk.Button(
+                self.binder_tabs_frame, text=label,
+                command=lambda selected=folder: self._open_binder_section(selected),
+                style="PolishUtility.TButton",
+            )
+            button.pack(fill="x", pady=(0, 8))
+            self.binder_section_buttons.append(button)
+        self._refresh_binder_shelf()
+        self._set_binder_page_message("Select a binder from the shelf.")
 
     def _refresh_binder_shelf(self) -> None:
         if not hasattr(self, "binder_shelf"):
             return
-        self.binder_shelf.delete("all")
         try:
-            all_records = list_binders(self.database, self.unit_root, self.farm_unit_root)
+            all_records = (
+                list_tool_binders(self.database, self.tool_root)
+                if getattr(self, "binder_mode", "fleet") == "tools"
+                else list_binders(self.database, self.unit_root, self.farm_unit_root)
+            )
         except Exception as error:
             self.binder_page_status_var.set(f"Binder shelf unavailable: {error}")
             self.binder_records = []
+            self.active_binder = None
+            self._binder_selected_identity = None
+            self._binder_selected_index = None
+            self._binder_hover_index = None
+            self._draw_binder_shelf()
             return
         query = self.binder_filter_var.get().strip().casefold()
-        self.binder_records = [record for record in all_records if query in record["unit"].casefold()]
-        y = 12
-        for index, binder in enumerate(self.binder_records):
-            fill = DARK_THEME["raised"] if binder["available"] else DARK_THEME["surface"]
-            outline = DARK_THEME["border"]
-            accent = DARK_THEME["teal"] if binder["available"] else DARK_THEME["muted"]
-            tag = f"binder-{index}"
-            self.binder_shelf.create_rectangle(12, y, 210, y + 42, fill=fill, outline=outline, width=1, tags=("binder", tag))
-            self.binder_shelf.create_rectangle(12, y, 16, y + 42, fill=accent, outline=accent, tags=("binder", tag))
-            suffix = "" if binder["available"] else "  •  folder missing"
-            self.binder_shelf.create_text(
-                26, y + 21, anchor="w", text=f"UNIT {binder['unit']}{suffix}",
-                fill=DARK_THEME["text"], font=("Segoe UI", 10, "bold"), tags=("binder", tag),
-            )
-            y += 50
-        self.binder_shelf.configure(scrollregion=(0, 0, 225, max(y, 1)))
+        binder_mode = getattr(self, "binder_mode", "fleet")
+        identity_field = "tool_id" if binder_mode == "tools" else "unit"
+        self.binder_records = [
+            record for record in all_records
+            if query in record[identity_field].casefold()
+            or (binder_mode == "tools" and query in record["description"].casefold())
+        ]
+        self._binder_hover_index = None
+        self._binder_selected_index = next(
+            (
+                index
+                for index, record in enumerate(self.binder_records)
+                if self._binder_identity(record) == self._binder_selected_identity
+            ),
+            None,
+        )
+        if self._binder_selected_index is None and self._binder_selected_identity is not None:
+            self._binder_selected_identity = None
+            self.active_binder = None
+        elif self._binder_selected_index is not None:
+            self.active_binder = self.binder_records[self._binder_selected_index]
+        self._draw_binder_shelf()
         available = sum(1 for record in all_records if record["available"])
         visible = f"{len(self.binder_records)} shown • " if query else ""
         self.binder_page_status_var.set(
-            f"{visible}{available} binder folder(s) available • {len(all_records)} database asset record(s)."
+            f"{visible}{available} binder folder(s) available • {len(all_records)} database record(s)."
         )
+
+    def _draw_binder_shelf(self) -> None:
+        self.binder_shelf.delete("all")
+        width = max(210, self.binder_shelf.winfo_width())
+        y = 12
+        for index, binder in enumerate(self.binder_records):
+            selected = index == self._binder_selected_index
+            hovered = index == self._binder_hover_index
+            fill = DARK_THEME["selected"] if selected else DARK_THEME["surface_hover"] if hovered else DARK_THEME["raised"]
+            if self.binder_mode == "tools":
+                accent = {
+                    "current": DARK_THEME["success"], "due_soon": DARK_THEME["warning"],
+                    "expired": DARK_THEME["danger"], "failed": DARK_THEME["danger"],
+                    "no_date": DARK_THEME["muted"],
+                }[binder["status"].code]
+            else:
+                accent = DARK_THEME["teal"] if binder["available"] else DARK_THEME["muted"]
+            tag = f"binder-{index}"
+            _rounded_rectangle(self.binder_shelf, 10, y, width - 12, y + 44, radius=9, fill=fill, outline=fill, tags=("binder", tag))
+            _rounded_rectangle(self.binder_shelf, 14, y + 10, 18, y + 34, radius=2, fill=accent, outline=accent, tags=("binder", tag))
+            suffix = "" if binder["available"] else "  •  folder missing"
+            title = f"TOOL {binder['tool_id']}" if self.binder_mode == "tools" else f"UNIT {binder['unit']}"
+            if self.binder_mode == "tools":
+                suffix = f"  •  {binder['status'].label}" + suffix
+            self.binder_shelf.create_text(
+                26, y + 21, anchor="w", text=f"{title}{suffix}",
+                fill=DARK_THEME["text"], font=("Segoe UI", 10, "bold"), tags=("binder", tag),
+            )
+            y += 52
+        self.binder_shelf.configure(scrollregion=(0, 0, width, max(y, 1)))
+
+    @staticmethod
+    def _binder_identity(binder: dict) -> tuple[str, str]:
+        return str(binder.get("tool_id", binder.get("unit", ""))), str(binder["folder"])
+
+    def _hover_binder_shelf(self, event) -> None:
+        canvas_y = self.binder_shelf.canvasy(event.y)
+        index = int((canvas_y - 12) // 52) if canvas_y >= 12 else None
+        if index is not None and not 0 <= index < len(self.binder_records):
+            index = None
+        if index != self._binder_hover_index:
+            self._binder_hover_index = index
+            self._draw_binder_shelf()
+
+    def _leave_binder_shelf(self, _event=None) -> None:
+        if self._binder_hover_index is not None:
+            self._binder_hover_index = None
+            self._draw_binder_shelf()
 
     def _select_binder_from_shelf(self, _event=None) -> None:
         tags = self.binder_shelf.gettags("current")
         index_tag = next((tag for tag in tags if tag.startswith("binder-")), None)
         if index_tag is None:
             return
-        binder = self.binder_records[int(index_tag.split("-", 1)[1])]
+        selected_index = int(index_tag.split("-", 1)[1])
+        if not 0 <= selected_index < len(self.binder_records):
+            return
+        self._binder_selected_index = selected_index
+        binder = self.binder_records[selected_index]
+        self._binder_selected_identity = self._binder_identity(binder)
         self.active_binder = binder
-        self.binder_title_var.set(f"Unit {binder['unit']}  •  {binder['owner'] or 'Unassigned ownership'}")
+        self._draw_binder_shelf()
+        if self.binder_mode == "tools":
+            self.binder_title_var.set(f"Tool {binder['tool_id']}  •  {binder['description']}  •  {binder['status'].message}")
+        else:
+            self.binder_title_var.set(f"Unit {binder['unit']}  •  {binder['owner'] or 'Unassigned ownership'}")
         if not binder["available"]:
-            self._set_binder_page_message("The canonical unit binder folder has not been created yet.")
+            self._set_binder_page_message("The canonical binder folder has not been created yet.")
             self.binder_page_status_var.set(str(binder["folder"]))
             self.binder_document_box.configure(values=())
             self.binder_document_var.set("")
             return
-        self._open_binder_section(BINDER_SECTIONS[0][1])
+        self._open_binder_section(self._binder_sections()[0][1])
 
     def _set_binder_page_message(self, message: str) -> None:
         self.binder_page_image = None
@@ -1046,14 +1663,15 @@ class DotReviewApp:
         self.binder_document_paths = {path.name: path for path in documents}
         self.binder_document_box.configure(values=tuple(self.binder_document_paths))
         self.binder_document_var.set(documents[0].name if documents else "")
-        label = next(label for label, folder in BINDER_SECTIONS if folder == section_folder)
+        label = next(label for label, folder in self._binder_sections() if folder == section_folder)
         if not documents:
             self.active_binder_pdf = None
             self.binder_page_index = 0
             self.binder_page_count = 0
             self.binder_page_image = None
             self._set_binder_page_message(f"No PDF documents in the {label} tab.\n\nUse Next Page to continue to the next category.")
-            self.binder_page_status_var.set(f"Unit {self.active_binder['unit']} • {label} • 0 documents")
+            identity = self.active_binder.get("tool_id", self.active_binder.get("unit", ""))
+            self.binder_page_status_var.set(f"{identity} • {label} • 0 documents")
             return
         document_index = min(max(document_index, 0), len(documents) - 1)
         self.binder_document_var.set(documents[document_index].name)
@@ -1071,11 +1689,11 @@ class DotReviewApp:
         if self.active_binder is None or self.active_binder_section is None:
             return
         section_index = next(
-            index for index, (_label, folder) in enumerate(BINDER_SECTIONS) if folder == self.active_binder_section
+            index for index, (_label, folder) in enumerate(self._binder_sections()) if folder == self.active_binder_section
         )
         page_counts = []
         documents_by_section = []
-        for _label, folder in BINDER_SECTIONS:
+        for _label, folder in self._binder_sections():
             documents = list_binder_documents(self.active_binder["folder"], folder)
             documents_by_section.append(documents)
             page_counts.append(
@@ -1102,7 +1720,7 @@ class DotReviewApp:
             return
         if target_section != section_index:
             self._open_binder_section(
-                BINDER_SECTIONS[target_section][1],
+                self._binder_sections()[target_section][1],
                 document_index=target_document or 0,
                 last_page=direction < 0 and target_document is not None,
             )
@@ -1164,7 +1782,7 @@ class DotReviewApp:
         )
         self.binder_page_canvas.xview_moveto(0)
         self.binder_page_canvas.yview_moveto(0)
-        label = next(label for label, folder in BINDER_SECTIONS if folder == self.active_binder_section)
+        label = next(label for label, folder in self._binder_sections() if folder == self.active_binder_section)
         self.binder_page_status_var.set(
             f"{label} • {self.active_binder_pdf.name} • Page {self.binder_page_index + 1} of {self.binder_page_count}"
         )
@@ -1365,7 +1983,7 @@ class DotReviewApp:
         }
         for index, pdf_path in enumerate(files, start=1):
             existing = approved_sources.get(str(pdf_path))
-            if existing:
+            if existing and self._source_matches_review_fingerprint(pdf_path, existing):
                 result = existing
             else:
                 try:
@@ -1374,6 +1992,7 @@ class DotReviewApp:
                         self.database,
                         self.unit_root,
                         farm_asset_folders_root=self.farm_unit_root,
+                        tool_folders_root=getattr(self, "tool_root", None),
                     )
                 except Exception as error:
                     result = {
@@ -1389,6 +2008,21 @@ class DotReviewApp:
                     }
             self.events.put(("result", result, index, len(files)))
         self.events.put(("scan_done",))
+
+    @staticmethod
+    def _source_matches_review_fingerprint(source: Path, result: dict) -> bool:
+        expected_hash = result.get("source_sha256")
+        expected_size = result.get("source_size")
+        if not expected_hash or expected_size is None:
+            return False
+        try:
+            current_size = source.stat().st_size
+            if current_size != int(expected_size):
+                return False
+            current_hash, _size = source_fingerprint(source)
+        except (OSError, TypeError, ValueError):
+            return False
+        return current_hash == expected_hash
 
     def _poll_events(self) -> None:
         try:
@@ -1541,7 +2175,7 @@ class DotReviewApp:
         counts = self.model.counts()
         for key, value in counts.items():
             label, title = self.count_labels[key]
-            label.configure(text=f"{title}  •  {value}")
+            label.set_value(value)
         self._refresh_table()
 
     def _refresh_table(self) -> None:
@@ -1636,8 +2270,11 @@ class DotReviewApp:
             self._set_review_action_state(False)
             return
         self._set_review_action_state(True)
-        self.unit_var.set(result.get("unit") or "")
+        self.unit_var.set(
+            result.get("subject_id") if result.get("subject_type") == "tool" else result.get("unit") or ""
+        )
         self.type_var.set(self._document_type_label(result.get("document_type")))
+        self._sync_review_field_labels()
         self.date_var.set(self._display_date(result.get("controlling_date")))
         self.page_var.set(result.get("page_suffix") or "")
         review_notes = "; ".join(
@@ -1678,15 +2315,45 @@ class DotReviewApp:
         self.sort_page_canvas.delete("all")
         width = max(300, self.sort_page_canvas.winfo_width())
         height = max(300, self.sort_page_canvas.winfo_height())
-        self.sort_page_canvas.create_text(
-            width // 2,
-            height // 2,
-            text=message,
+        center_x = width // 2
+        center_y = height // 2
+        icon_top = center_y - 58
+        self.sort_page_canvas.create_rectangle(
+            center_x - 18,
+            icon_top,
+            center_x + 18,
+            icon_top + 42,
+            outline=DARK_THEME["muted"],
+            width=2,
+        )
+        self.sort_page_canvas.create_line(
+            center_x + 7,
+            icon_top,
+            center_x + 18,
+            icon_top + 11,
             fill=DARK_THEME["muted"],
-            font=("Segoe UI", 11),
+            width=2,
+        )
+        lines = message.split("\n\n", 1)
+        self.sort_page_canvas.create_text(
+            center_x,
+            center_y + 8,
+            text=lines[0],
+            fill=DARK_THEME["secondary"],
+            font=("Segoe UI", 11, "bold"),
             justify="center",
             width=max(260, width - 50),
         )
+        if len(lines) > 1:
+            self.sort_page_canvas.create_text(
+                center_x,
+                center_y + 34,
+                text=lines[1],
+                fill=DARK_THEME["muted"],
+                font=("Segoe UI", 9),
+                justify="center",
+                width=max(260, width - 50),
+            )
         self.sort_page_canvas.configure(scrollregion=(0, 0, width, height))
 
     def _render_selected_sort_page(self) -> None:
@@ -1844,6 +2511,7 @@ class DotReviewApp:
                 page_suffix=self.page_var.get(),
                 unit_folders_root=self.unit_root,
                 farm_asset_folders_root=self.farm_unit_root,
+                tool_folders_root=getattr(self, "tool_root", None),
                 database_path=self.database,
                 audit_path=self.audit_path,
             )
@@ -2001,6 +2669,7 @@ class DotReviewApp:
                 page_suffix=self.page_var.get(),
                 unit_folders_root=self.unit_root,
                 farm_asset_folders_root=self.farm_unit_root,
+                tool_folders_root=getattr(self, "tool_root", None),
                 database_path=self.database,
                 audit_path=self.audit_path,
             )
@@ -2018,6 +2687,7 @@ class DotReviewApp:
                 incoming_folder=self.incoming,
                 approved_folder=self.approved,
                 farm_asset_folders_root=self.farm_unit_root,
+                tool_folders_root=getattr(self, "tool_root", None),
                 database_path=self.database,
             )
         except ApprovalError as error:

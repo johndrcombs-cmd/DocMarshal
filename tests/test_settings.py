@@ -18,6 +18,7 @@ def test_settings_cover_user_specific_paths_and_preserve_unknown_values(tmp_path
         "manual_assets_registry": "C:/Old/manual.json",
         "unit_folders_root": "C:/Old/Fleet",
         "farm_asset_folders_root": "C:/Old/Farm",
+        "tool_folders_root": "C:/Old/Tools",
         "deployment_specific_value": "preserve-me",
     }
     config_path.write_text(json.dumps(current), encoding="utf-8")
@@ -41,6 +42,7 @@ def test_settings_cover_user_specific_paths_and_preserve_unknown_values(tmp_path
         "fleet_database",
         "unit_folders_root",
         "farm_asset_folders_root",
+        "tool_folders_root",
     }
 
 

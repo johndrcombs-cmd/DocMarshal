@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from dotdocs.naming import build_filename, destination_subfolder
+from dotdocs.naming import build_filename, build_tool_filename, destination_subfolder
 
 
 @pytest.mark.parametrize(
@@ -43,3 +43,8 @@ def test_adds_meaningful_suffix_without_overwriting():
 )
 def test_maps_document_types_to_existing_subfolders(document_type, expected):
     assert destination_subfolder(document_type) == expected
+
+
+def test_builds_calibration_filename_for_alphanumeric_tool_id():
+    assert build_tool_filename("Cal-001", date(2027, 9, 30)) == "CAL-001_CAL_09-30-2027.pdf"
+    assert destination_subfolder("CAL") == "001_Calibration_Certifications"

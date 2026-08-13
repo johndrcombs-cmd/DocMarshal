@@ -17,6 +17,7 @@ SETTING_DEFINITIONS = (
     {"key": "manual_assets_registry", "label": "Legacy Manual Asset Registry", "kind": "file"},
     {"key": "unit_folders_root", "label": "Company Virtual Binder Root", "kind": "directory"},
     {"key": "farm_asset_folders_root", "label": "Farm Virtual Binder Root", "kind": "directory"},
+    {"key": "tool_folders_root", "label": "Tool Virtual Binder Root", "kind": "directory"},
 )
 
 

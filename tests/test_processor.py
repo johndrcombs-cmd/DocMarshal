@@ -3,6 +3,7 @@ from openpyxl import Workbook
 
 from dotdocs.database import import_fleet_workbook
 from dotdocs.processor import analyze_pdf, find_unit_folder
+from dotdocs.tools_database import create_tool
 
 
 def _database(tmp_path):
@@ -92,3 +93,42 @@ def test_find_unit_folder_accepts_only_exact_canonical_folder(tmp_path):
     assert find_unit_folder(root, "305") == canonical
     canonical.rmdir()
     assert find_unit_folder(root, "305") is None
+
+
+def test_analyzes_calibration_certificate_as_tool_subject_without_unit_matching(tmp_path):
+    database = _database(tmp_path)
+    create_tool(database, {
+        "tool_id": "CAL-001", "description": "Pressure gauge", "serial_number": "SN-441",
+    })
+    tool_root = tmp_path / "Tool Binders"
+    destination = tool_root / "Tool_CAL-001" / "001_Calibration_Certifications"
+    destination.mkdir(parents=True)
+    pdf = tmp_path / "calibration.pdf"
+    _searchable_pdf(
+        pdf,
+        "ISO 17025 CERTIFICATE OF CALIBRATION Serial No. SN-441 Calibration Date 9/30/2026 Due Date 9/30/2027",
+    )
+
+    result = analyze_pdf(pdf, database, tmp_path / "Fleet", tool_folders_root=tool_root)
+
+    assert result["status"] == "ready_for_review"
+    assert result["subject_type"] == "tool"
+    assert result["subject_id"] == "CAL-001"
+    assert result["unit"] is None
+    assert result["document_type"] == "CAL"
+    assert result["controlling_date"] == "2027-09-30"
+    assert result["proposed_filename"] == "CAL-001_CAL_09-30-2027.pdf"
+    assert result["proposed_destination"] == str(destination / "CAL-001_CAL_09-30-2027.pdf")
+
+
+def test_calibration_certificate_with_unlabeled_model_text_does_not_guess_tool(tmp_path):
+    database = _database(tmp_path)
+    create_tool(database, {"tool_id": "CAL-001", "description": "Pressure gauge", "model": "441"})
+    pdf = tmp_path / "calibration.pdf"
+    _searchable_pdf(pdf, "CERTIFICATE OF CALIBRATION model 441 Due Date 9/30/2027")
+
+    result = analyze_pdf(pdf, database, tmp_path, tool_folders_root=tmp_path / "Tools")
+
+    assert result["subject_type"] == "tool"
+    assert result["subject_id"] is None
+    assert "TOOL_UNMATCHED" in result["reasons"]

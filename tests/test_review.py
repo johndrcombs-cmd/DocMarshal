@@ -19,6 +19,7 @@ from dotdocs.review import (
     record_asset_created,
     restore_archived_document,
 )
+from dotdocs.tools_database import create_tool, list_tool_certifications
 
 
 def _unit_root(tmp_path):
@@ -78,6 +79,30 @@ def test_apply_correction_recalculates_ready_proposal(tmp_path):
         "Unit_91\\004_Maintenance_Records\\91_RP_07-07-2026.pdf"
     )
     assert corrected["manually_corrected"] is True
+
+
+def test_apply_correction_routes_calibration_to_verified_tool_binder(tmp_path):
+    database = tmp_path / "fleet.db"
+    create_tool(database, {"tool_id": "CAL-001", "description": "Pressure gauge"})
+    tool_root = tmp_path / "Tools"
+    tool_root.mkdir()
+    destination_folder = tool_root / "Tool_CAL-001" / "001_Calibration_Certifications"
+    result = _result(tmp_path)
+    result.update({"subject_type": "tool", "subject_id": "CAL-001", "unit": None, "document_type": "CAL"})
+
+    corrected = apply_correction(
+        result, unit="CAL-001", document_type="CAL", controlling_date="09/30/2027",
+        unit_folders_root=tmp_path / "Fleet", tool_folders_root=tool_root, database_path=database,
+    )
+
+    assert corrected["subject_type"] == "tool"
+    assert corrected["subject_id"] == "CAL-001"
+    assert corrected["unit"] is None
+    assert Path(corrected["proposed_destination"]) == destination_folder / "CAL-001_CAL_09-30-2027.pdf"
+    assert sorted(path.name for path in (tool_root / "Tool_CAL-001").iterdir()) == [
+        "001_Calibration_Certifications",
+        "002_Misc",
+    ]
 
 
 def test_apply_correction_does_not_mark_unchanged_review_fields_manual(tmp_path):
@@ -332,6 +357,33 @@ def test_approve_document_copies_and_archives_source_and_writes_audit(tmp_path):
     assert entries[-1]["source_file"] == str(source)
     assert entries[-1]["destination"] == str(destination)
     assert entries[-1]["archived_file"] == str(archive)
+
+
+def test_approve_calibration_links_verified_copy_to_tool_history(tmp_path):
+    database = tmp_path / "fleet.db"
+    tool = create_tool(database, {"tool_id": "CAL-001", "description": "Pressure gauge"})
+    tool_root = tmp_path / "Tools"
+    destination_folder = tool_root / "Tool_CAL-001" / "001_Calibration_Certifications"
+    destination_folder.mkdir(parents=True)
+    result = _result(tmp_path)
+    result.update({"subject_type": "tool", "subject_id": "CAL-001", "unit": None, "document_type": "CAL"})
+    corrected = apply_correction(
+        result, unit="CAL-001", document_type="CAL", controlling_date="09/30/2027",
+        unit_folders_root=tmp_path / "Fleet", tool_folders_root=tool_root, database_path=database,
+    )
+
+    approved = approve_document(
+        corrected, audit_path=tmp_path / "Review" / "audit.jsonl",
+        unit_folders_root=tmp_path / "Fleet", tool_folders_root=tool_root,
+        incoming_folder=Path(corrected["source_file"]).parent,
+        approved_folder=tmp_path / "Approved", database_path=database,
+    )
+
+    history = list_tool_certifications(database, tool["id"])
+    assert len(history) == 1
+    assert history[0]["due_date"] == "2027-09-30"
+    assert history[0]["document_path"] == approved["approved_destination"]
+    assert history[0]["document_sha256"] == corrected["source_sha256"]
 
 
 def test_approve_document_rejects_approved_folder_equal_to_incoming_before_side_effects(tmp_path):

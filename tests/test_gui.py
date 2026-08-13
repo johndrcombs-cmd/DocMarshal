@@ -1,12 +1,75 @@
 from pathlib import Path
 import queue
+import tkinter as tk
+from tkinter import ttk
+
+import pytest
 
 from dotdocs import gui
+from dotdocs.ui_layout import RoundedButton, StatusCard
 
 
 def _gui_sources() -> str:
     gui_path = Path(gui.__file__)
     return gui_path.read_text(encoding="utf-8") + (gui_path.parent / "ui_layout.py").read_text(encoding="utf-8")
+
+
+def _contrast_ratio(foreground: str, background: str) -> float:
+    def luminance(color: str) -> float:
+        channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_rounded_button_preserves_native_ttk_configuration_and_disabled_semantics():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        calls = []
+        button = RoundedButton(
+            root,
+            text="Approve",
+            command=lambda: calls.append("called"),
+            theme=gui.DARK_THEME,
+            role="primary",
+        )
+
+        assert isinstance(button, ttk.Button)
+        assert isinstance(button.configure(), dict)
+        assert str(button.configure("state")[-1]) == "normal"
+        assert button.cget("text") == "Approve"
+        button.configure(text="File Copy", state="disabled")
+        assert button.cget("text") == "File Copy"
+        assert str(button.cget("state")) == "disabled"
+        assert button.instate(("disabled",))
+        button.invoke()
+        assert calls == []
+        button.configure(state="normal")
+        button.invoke()
+        assert calls == ["called"]
+    finally:
+        root.destroy()
+
+
+def test_status_card_uses_value_api_without_overriding_canvas_configuration():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        card = StatusCard(root, title="Ready", color=gui.DARK_THEME["teal"], theme=gui.DARK_THEME)
+        assert isinstance(card.configure(), dict)
+        assert int(card.configure("width")[-1]) == 160
+        card.set_value(12)
+        assert card.value == "12"
+    finally:
+        root.destroy()
+
+
+def test_muted_text_meets_normal_text_contrast_on_every_used_surface():
+    for surface_name in ("surface", "raised", "input"):
+        assert _contrast_ratio(gui.DARK_THEME["muted"], gui.DARK_THEME[surface_name]) >= 4.5, surface_name
 
 
 class _Value:
@@ -80,6 +143,84 @@ class _SelectionTable:
         self.selected = tuple(items)
 
 
+class _BinderCanvas:
+    def __init__(self, tags=()):
+        self.tags = tuple(tags)
+        self.deleted = []
+
+    def gettags(self, _item):
+        return self.tags
+
+    def delete(self, item):
+        self.deleted.append(item)
+
+
+def _binder_record(tmp_path, unit):
+    return {
+        "unit": unit,
+        "owner": "Company",
+        "folder": tmp_path / f"Unit_{unit}",
+        "available": False,
+    }
+
+
+def test_binder_refresh_recomputes_selected_index_from_stable_identity(monkeypatch, tmp_path):
+    records = [_binder_record(tmp_path, "101"), _binder_record(tmp_path, "204")]
+    refreshed_records = [dict(record) for record in records]
+    refreshed_records[1]["owner"] = "Updated owner"
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.database = tmp_path / "fleet.db"
+    app.unit_root = tmp_path
+    app.farm_unit_root = tmp_path
+    app.binder_shelf = _BinderCanvas()
+    app.binder_filter_var = _Value("204")
+    app.binder_page_status_var = _Value()
+    app.binder_records = records
+    app.active_binder = records[1]
+    app._binder_selected_identity = ("204", str(records[1]["folder"]))
+    app._binder_selected_index = 1
+    app._binder_hover_index = None
+    drawn = []
+    app._draw_binder_shelf = lambda: drawn.append(tuple(record["unit"] for record in app.binder_records))
+    monkeypatch.setattr(gui, "list_binders", lambda *_args: refreshed_records)
+
+    app._refresh_binder_shelf()
+
+    assert [record["unit"] for record in app.binder_records] == ["204"]
+    assert app._binder_selected_index == 0
+    assert app.active_binder is app.binder_records[0]
+    assert app.active_binder["owner"] == "Updated owner"
+    assert drawn == [("204",)]
+
+
+def test_binder_refresh_failure_clears_records_selection_and_stale_canvas(monkeypatch, tmp_path):
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.database = tmp_path / "fleet.db"
+    app.unit_root = tmp_path
+    app.farm_unit_root = tmp_path
+    app.binder_shelf = _BinderCanvas(("binder-0",))
+    app.binder_filter_var = _Value("")
+    app.binder_page_status_var = _Value()
+    app.binder_records = [_binder_record(tmp_path, "101")]
+    app.active_binder = app.binder_records[0]
+    app._binder_selected_identity = ("101", str(app.active_binder["folder"]))
+    app._binder_selected_index = 0
+    app._binder_hover_index = 0
+    app._draw_binder_shelf = lambda: app.binder_shelf.delete("all")
+    monkeypatch.setattr(gui, "list_binders", lambda *_args: (_ for _ in ()).throw(RuntimeError("offline")))
+
+    app._refresh_binder_shelf()
+    app._select_binder_from_shelf()
+
+    assert app.binder_records == []
+    assert app.active_binder is None
+    assert app._binder_selected_identity is None
+    assert app._binder_selected_index is None
+    assert app._binder_hover_index is None
+    assert app.binder_shelf.deleted == ["all"]
+    assert app.binder_page_status_var.get() == "Binder shelf unavailable: offline"
+
+
 def test_document_type_choices_include_distinct_registration_documents():
     assert gui.DOCUMENT_TYPE_CHOICES == (
         "DOT",
@@ -90,34 +231,231 @@ def test_document_type_choices_include_distinct_registration_documents():
         "CAB",
         "INS",
         "MISC",
+        "CAL",
     )
     assert gui.DOCUMENT_TYPE_LABELS["MISC"] == "Misc"
     assert gui.DOCUMENT_TYPE_LABELS["CAB"] == "CAB Card"
+    assert gui.DOCUMENT_TYPE_LABELS["CAL"] == "Calibration / Certification"
+    assert set(gui.DOCUMENT_TYPE_CHOICES) <= set(gui.DOCUMENT_TYPE_LABELS)
+
+
+@pytest.mark.parametrize(
+    ("document_type", "subject_label", "date_label"),
+    (
+        ("DOT", "Unit", "Inspection Date"),
+        ("RP", "Unit", "Service / Invoice Date"),
+        ("REG", "Unit", "Expiration Date"),
+        ("CAB", "Unit", "Expiration Date"),
+        ("INS", "Unit", "Expiration Date"),
+        ("TITLE", "Unit", "Issue Date"),
+        ("CERTORIGIN", "Unit", "Issue Date"),
+        ("MISC", "Unit", "Document Date"),
+        ("CAL", "Tool ID", "Due / Expiration Date"),
+    ),
+)
+def test_review_fields_align_with_selected_document_type(document_type, subject_label, date_label):
+    assert gui.DotReviewApp._review_field_labels(document_type) == (subject_label, date_label)
+
+
+def test_review_inspector_updates_labels_from_display_document_type():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.type_var = _Value("Calibration / Certification")
+    app.subject_field_label_var = _Value("Unit")
+    app.date_field_label_var = _Value("Controlling Date")
+
+    app._sync_review_field_labels()
+
+    assert app.subject_field_label_var.get() == "Tool ID"
+    assert app.date_field_label_var.get() == "Due / Expiration Date"
+
+
+def test_changing_document_domain_clears_stale_identifier_and_date():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.type_var = _Value("Calibration / Certification")
+    app.unit_var = _Value("091")
+    app.date_var = _Value("07/07/2026")
+    app.subject_field_label_var = _Value("Unit")
+    app.date_field_label_var = _Value("Inspection Date")
+
+    app._on_review_document_type_changed()
+
+    assert app.unit_var.get() == ""
+    assert app.date_var.get() == ""
+    assert app.subject_field_label_var.get() == "Tool ID"
 
 
 def test_fixed_dark_theme_declares_professional_command_center_palette():
     assert gui.DARK_THEME == {
-        "window": "#080D14",
-        "navigation": "#0D141F",
-        "surface": "#111A27",
-        "raised": "#162131",
-        "input": "#1B293A",
+        "window": "#090E17",
+        "navigation": "#0D1420",
+        "surface": "#111B29",
+        "raised": "#172334",
+        "input": "#1B293B",
         "surface_hover": "#22334A",
-        "border": "#2A3B50",
+        "selected": "#203B50",
+        "border": "#223247",
+        "border_quiet": "#182536",
         "border_focus": "#27C2D1",
         "accent": "#F5A814",
         "accent_hover": "#FFB92E",
+        "amber_soft": "#D7A247",
         "cyan": "#27C2D1",
         "teal": "#27D3A2",
         "indigo": "#8B7CF6",
         "magenta": "#D65AD1",
-        "text": "#F3F7FB",
-        "secondary": "#A8B5C5",
-        "muted": "#68778A",
+        "text": "#F2F6FA",
+        "secondary": "#A5B3C4",
+        "muted": "#7F91A9",
         "success": "#28C890",
         "warning": "#F2B84B",
         "danger": "#F06464",
     }
+
+
+def test_visual_polish_tokens_define_layered_surfaces_spacing_and_rounding():
+    assert gui.DARK_THEME["window"] == "#090E17"
+    assert gui.DARK_THEME["navigation"] == "#0D1420"
+    assert gui.DARK_THEME["surface"] == "#111B29"
+    assert gui.DARK_THEME["raised"] == "#172334"
+    assert gui.DARK_THEME["input"] == "#1B293B"
+    assert gui.DARK_THEME["surface_hover"] == "#22334A"
+    assert gui.DARK_THEME["selected"] == "#203B50"
+    assert gui.UI_TOKENS["radius"]["panel"] == 11
+    assert gui.UI_TOKENS["radius"]["button"] == 8
+    assert gui.UI_TOKENS["radius"]["input"] == 8
+    assert gui.UI_TOKENS["spacing"]["outer"] == 8
+    assert gui.UI_TOKENS["spacing"]["pane_gap"] == 8
+
+
+def test_component_polish_declares_elevation_motion_and_soft_amber_tokens():
+    assert gui.UI_TOKENS["radius"] == {
+        "panel": 11,
+        "card": 10,
+        "button": 8,
+        "input": 8,
+        "pill": 18,
+        "dialog": 13,
+    }
+    assert gui.UI_TOKENS["elevation"]["panel"] >= 2
+    assert gui.UI_TOKENS["elevation"]["toolbar"] >= 1
+    assert 120 <= gui.UI_TOKENS["motion_ms"]["hover"] <= 180
+    assert gui.DARK_THEME["amber_soft"] != gui.DARK_THEME["accent"]
+
+
+def test_action_button_roles_have_visible_normal_state_affordance():
+    from dotdocs.ui_layout import button_role_visuals
+
+    visuals = button_role_visuals(gui.DARK_THEME)
+    for role in ("secondary", "warning", "danger"):
+        normal_fill, _hover_fill, _pressed_fill, border = visuals[role]
+        assert normal_fill != gui.DARK_THEME["raised"], role
+        assert border != normal_fill, role
+
+    assert visuals["warning"][3] == gui.DARK_THEME["warning"]
+    assert visuals["danger"][3] == gui.DARK_THEME["danger"]
+
+
+def test_component_polish_uses_native_rounded_styles_and_segmented_navigation():
+    source = _gui_sources()
+
+    assert "install_rounded_ttk_elements" in source
+    assert 'style="Rounded.TEntry"' in source
+    assert 'style="Rounded.TCombobox"' in source
+    assert 'style="Thin.Vertical.TScrollbar"' in source
+    assert 'style="Modern.Treeview"' in source
+    assert "SegmentedNavigation" in source
+    assert 'style="Segment.TButton"' in source
+    assert 'style="Selected.Segment.TButton"' in source
+
+
+def test_all_workspaces_use_rounded_panel_toolbar_table_and_footer_hosts():
+    source = _gui_sources()
+
+    for name in (
+        "database_toolbar_surface",
+        "database_table_surface",
+        "settings_heading_surface",
+        "settings_processing_surface",
+        "settings_binder_surface",
+        "settings_footer_surface",
+        "binder_shelf_surface",
+        "binder_viewer_surface",
+        "binder_toolbar_surface",
+        "sort_action_footer_surface",
+    ):
+        assert name in source
+
+
+def test_database_workspace_exposes_first_class_tools_and_calibration_view():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert "Tools & Calibration" in source
+    assert "self.tools_table" in source
+    assert "self.tool_field_vars" in source
+    assert "self.tool_history_table" in source
+    assert "def _save_tool_record" in source
+    assert "def _add_tool_certification" in source
+    assert "def _import_tools_database" in source
+    assert "def _export_tools_database" in source
+    assert "Due Soon" in source
+    assert "Expired" in source
+
+
+def test_add_tool_button_saves_populated_new_tool_instead_of_clearing_editor():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.active_tool_id = None
+    app.tool_field_vars = {
+        "tool_id": _Value("CAL-001"),
+        "description": _Value("Pressure gauge"),
+        "serial_number": _Value("SN-441"),
+    }
+    actions = []
+    app._save_tool_record = lambda: actions.append("save")
+    app._new_tool_record = lambda: actions.append("clear")
+
+    app._add_tool_record()
+
+    assert actions == ["save"]
+
+
+def test_add_tool_button_starts_blank_editor_when_no_new_details_exist():
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.active_tool_id = None
+    app.tool_field_vars = {"tool_id": _Value(""), "description": _Value("")}
+    actions = []
+    app._save_tool_record = lambda: actions.append("save")
+    app._new_tool_record = lambda: actions.append("clear")
+
+    app._add_tool_record()
+
+    assert actions == ["clear"]
+
+
+def test_binder_shelf_uses_rounded_hoverable_selected_entries():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert "_draw_binder_shelf" in source
+    assert "_binder_hover_index" in source
+    assert "_binder_selected_index" in source
+    assert "create_rectangle(12, y, 210" not in source
+
+
+def test_sort_polish_uses_rounded_surfaces_title_case_and_button_hierarchy():
+    source = _gui_sources()
+
+    assert "RoundedSurface" in source
+    assert "RoundedButton" in source
+    assert '"Document Queue"' in source
+    assert '"Document Viewer"' in source
+    assert '"Review Inspector"' in source
+    assert '"Classification"' in source
+    assert '"File Details"' in source
+    assert 'role="primary"' in source
+    assert 'role="secondary"' in source
+    assert 'role="utility"' in source
+    assert 'role="warning"' in source
+    assert 'role="danger"' in source
+    assert 'style="Borderless.TFrame"' in source
 
 
 def test_sort_workspace_declares_compact_shell_three_panes_and_reset_control():
@@ -232,6 +570,61 @@ def test_new_approved_record_never_falls_back_when_declared_archive_is_missing(t
 
     assert gui.approved_record_path(record) is None
     assert not gui.approved_record_file_exists(record)
+
+
+def test_scan_does_not_reuse_approved_record_when_scanner_reuses_filename(monkeypatch, tmp_path):
+    source = tmp_path / "Incoming" / "doc.pdf"
+    source.parent.mkdir()
+    source.write_bytes(b"new-pdf-content")
+    old_record = {
+        "source_file": str(source),
+        "source_sha256": "0" * 64,
+        "source_size": 999,
+        "status": "approved",
+    }
+    analyzed = dict(old_record, status="needs_review", source_size=source.stat().st_size)
+    calls = []
+    monkeypatch.setattr(gui, "analyze_pdf", lambda path, *_args, **_kwargs: calls.append(path) or analyzed)
+
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.model = gui.ReviewModel([old_record])
+    app.events = queue.Queue()
+    app.database = tmp_path / "fleet.db"
+    app.unit_root = tmp_path / "Fleet"
+    app.farm_unit_root = tmp_path / "Farm"
+    app.tool_root = tmp_path / "Tools"
+
+    app._scan_worker([source])
+
+    assert calls == [source]
+    assert app.events.get_nowait()[1]["status"] == "needs_review"
+
+
+def test_scan_reuses_approved_record_only_when_fingerprint_still_matches(monkeypatch, tmp_path):
+    import hashlib
+
+    source = tmp_path / "Incoming" / "doc.pdf"
+    source.parent.mkdir()
+    source.write_bytes(b"same-pdf-content")
+    approved = {
+        "source_file": str(source),
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "source_size": source.stat().st_size,
+        "status": "approved",
+    }
+    monkeypatch.setattr(gui, "analyze_pdf", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not reanalyze")))
+
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.model = gui.ReviewModel([approved])
+    app.events = queue.Queue()
+    app.database = tmp_path / "fleet.db"
+    app.unit_root = tmp_path / "Fleet"
+    app.farm_unit_root = tmp_path / "Farm"
+    app.tool_root = tmp_path / "Tools"
+
+    app._scan_worker([source])
+
+    assert app.events.get_nowait()[1] is approved
 
 
 def test_open_pdf_uses_archived_or_legacy_approved_path_without_unsafe_fallback(monkeypatch, tmp_path):

@@ -11,6 +11,7 @@ identity_result = shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL
 from tkinter import messagebox
 
 from dotdocs.gui import launch
+from dotdocs.windows import focus_existing_window
 
 ROOT = Path(__file__).resolve().parent
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -31,7 +32,8 @@ if not mutex:
 
 try:
     if mutex_error == 183:
-        messagebox.showinfo("DocMarshal", "DocMarshal is already running.")
+        if not focus_existing_window("DocMarshal"):
+            messagebox.showinfo("DocMarshal", "DocMarshal is already running.")
     else:
         launch(ROOT / "config.json")
 finally:

@@ -7,13 +7,16 @@ from openpyxl import Workbook
 
 from dotdocs.binder import (
     BINDER_SECTIONS,
+    TOOL_BINDER_SECTIONS,
     advance_binder_position,
     list_binder_documents,
     list_binders,
+    list_tool_binders,
     render_binder_page,
     render_pdf_page,
 )
 from dotdocs.database import import_fleet_workbook
+from dotdocs.tools_database import create_tool
 
 
 def _database(tmp_path):
@@ -43,6 +46,34 @@ def test_lists_ownership_aware_binder_spines_and_availability(tmp_path):
         ("305", "Farm Asset", False),
     ]
     assert binders[1]["folder"] == farm / "Unit_305"
+
+
+def test_lists_tool_binders_with_calibration_status_and_canonical_folders(tmp_path):
+    database = tmp_path / "fleet.db"
+    current = create_tool(database, {
+        "tool_id": "CAL-001", "description": "Pressure gauge", "serial_number": "SN-1",
+        "calibration_required": True,
+    })
+    create_tool(database, {
+        "tool_id": "CAL-002", "description": "Inactive wrench", "active": False,
+        "calibration_required": True,
+    })
+    root = tmp_path / "Tools"
+    (root / "Tool_CAL-001").mkdir(parents=True)
+
+    binders = list_tool_binders(database, root)
+
+    assert len(binders) == 1
+    assert binders[0]["tool_id"] == "CAL-001"
+    assert binders[0]["description"] == "Pressure gauge"
+    assert binders[0]["folder"] == root / "Tool_CAL-001"
+    assert binders[0]["available"] is True
+    assert binders[0]["status"].code == "no_date"
+    assert current["id"] == binders[0]["database_id"]
+    assert TOOL_BINDER_SECTIONS == (
+        ("Calibration / Certification", "001_Calibration_Certifications"),
+        ("Misc", "002_Misc"),
+    )
 
 
 def test_lists_only_direct_pdfs_in_a_canonical_binder_tab(tmp_path):
