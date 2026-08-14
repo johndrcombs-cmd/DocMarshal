@@ -532,37 +532,6 @@ def mark_duplicate_document(
             "The source PDF changed since review; scan it again before marking it duplicate."
         )
 
-    normalized_unit = normalize_unit(unit)
-    if not normalized_unit:
-        raise ReviewValidationError("A unit number is required.")
-    normalized_type = document_type.strip().upper()
-    if normalized_type not in ALLOWED_DOCUMENT_TYPES:
-        raise ReviewValidationError(DOCUMENT_TYPE_ERROR)
-    parsed_date = _parse_review_date(controlling_date)
-    trusted_owner = (
-        find_asset_owner(database_path, normalized_unit)
-        if database_path
-        else result.get("asset_owner")
-    )
-    try:
-        selected_root = asset_folder_root(
-            trusted_owner, unit_folders_root, farm_asset_folders_root
-        )
-    except AssetValidationError as error:
-        raise ReviewValidationError(str(error)) from error
-    unit_folder = find_unit_folder(selected_root, normalized_unit)
-    if unit_folder is None:
-        raise ReviewValidationError(
-            f"No production folder was found for unit {normalized_unit}."
-        )
-    filename = build_filename(normalized_unit, normalized_type, parsed_date)
-    destination = unit_folder / destination_subfolder(normalized_type) / filename
-    if not destination.is_file():
-        raise ReviewValidationError(
-            "The expected production file does not exist, so this document cannot be marked as a duplicate: "
-            f"{destination}"
-        )
-
     processed_folder = Path(processed_folder)
     processed_folder.mkdir(parents=True, exist_ok=True)
     duplicate_folder = processed_folder / "Duplicates"
@@ -578,12 +547,12 @@ def mark_duplicate_document(
     started_entry = {
         "source_file": str(source),
         "archived_file": str(archive),
-        "destination": str(destination),
-        "unit": normalized_unit,
-        "asset_owner": trusted_owner,
-        "document_type": normalized_type,
-        "controlling_date": parsed_date.isoformat(),
+        "reviewed_subject_type": result.get("subject_type"),
+        "reviewed_subject_id": result.get("subject_id") or result.get("unit") or str(unit).strip() or None,
+        "reviewed_document_type": result.get("document_type") or str(document_type).strip().upper() or None,
+        "reviewed_controlling_date": result.get("controlling_date") or str(controlling_date).strip() or None,
         "source_sha256": expected_hash,
+        "source_size": expected_size,
     }
     _append_audit(audit_path, {"event": "duplicate_mark_started", **started_entry})
     archived = False
@@ -623,14 +592,10 @@ def mark_duplicate_document(
     duplicate.update(
         {
             "status": "duplicate",
-            "reasons": ["DUPLICATE_OF_EXISTING_PRODUCTION_DOCUMENT"],
-            "unit": normalized_unit,
-            "asset_owner": trusted_owner,
-            "document_type": normalized_type,
-            "controlling_date": parsed_date.isoformat(),
-            "proposed_filename": filename,
-            "proposed_destination": str(destination),
-            "duplicate_destination": str(destination),
+            "reasons": ["MARKED_DUPLICATE_BY_REVIEWER"],
+            "proposed_filename": None,
+            "proposed_destination": None,
+            "duplicate_destination": None,
             "duplicate_archived_file": str(archive),
             "duplicate_at_utc": datetime.now(timezone.utc).isoformat(),
         }

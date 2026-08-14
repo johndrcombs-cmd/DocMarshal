@@ -39,8 +39,11 @@ from .document_import import (
     ocr_candidate_paths,
     run_pdf_ocr,
 )
+from .intake_index import source_snapshot_matches
 from .naming import DOCUMENT_TYPE_CHOICES
 from .processor import analyze_pdf, source_fingerprint
+from .printing import PrintLaunchError, launch_pdf_print_dialog
+from .scanner import SCAN_MODE_COMBINED, ScannerError, scan_to_incoming
 from .settings import SETTING_DEFINITIONS, save_user_settings
 from .tool_calibration import calibration_status
 from .tools_database import (
@@ -202,6 +205,7 @@ class DotReviewApp:
         self.events: queue.Queue = queue.Queue()
         self.row_sources: dict[str, str] = {}
         self.scanning = False
+        self.scanner_running = False
         self.ocr_running = False
         self.bulk_action_running = False
         self.session_load_error = None
@@ -733,7 +737,8 @@ class DotReviewApp:
             self.not_dot_button,
             self.restore_button,
         ):
-            widget.configure(state=state)
+            if widget is not None:
+                widget.configure(state=state)
 
     def _on_tab_changed(self, _event=None) -> None:
         selected = self.navigation.select()
@@ -1424,6 +1429,13 @@ class DotReviewApp:
             document_bar, text="Zoom In", command=lambda: self._change_binder_zoom(0.25),
             style="PolishUtility.TButton",
         ).pack(side="left", padx=3)
+        self.binder_print_button = ttk.Button(
+            document_bar,
+            text="Print",
+            command=self.print_active_binder_document,
+            style="PolishUtility.TButton",
+        )
+        self.binder_print_button.pack(side="left", padx=(7, 0))
 
         page_area = ttk.Frame(viewer, style="GlassContent.TFrame")
         page_area.pack(fill="both", expand=True)
@@ -1743,6 +1755,22 @@ class DotReviewApp:
         self.binder_zoom_var.set("100%")
         self._render_active_binder_page()
 
+    def print_active_binder_document(self) -> None:
+        current = self.active_binder_pdf
+        if current is None:
+            messagebox.showinfo("No PDF selected", "Select a PDF in the Virtual Binder before printing.")
+            return
+        current = Path(current)
+        if not current.is_file():
+            messagebox.showerror("PDF unavailable", f"Cannot find the current Binder PDF:\n{current}")
+            return
+        try:
+            launch_pdf_print_dialog(current)
+        except PrintLaunchError as error:
+            messagebox.showerror("Print dialog unavailable", str(error))
+            return
+        self.binder_page_status_var.set(f"Print dialog opened for {current.name}.")
+
     def _render_active_binder_page(self) -> None:
         if self.active_binder_pdf is None or self.active_binder_section is None or self.active_binder is None:
             return
@@ -1935,8 +1963,8 @@ class DotReviewApp:
         summary["report_path"] = str(report_path)
         self.events.put(("bulk_ocr_done", summary))
 
-    def scan_incoming(self) -> None:
-        if self.scanning or self.ocr_running or getattr(self, "bulk_action_running", False):
+    def scan_incoming(self, target_files: list[Path] | None = None) -> None:
+        if self.scanning or self.scanner_running or self.ocr_running or getattr(self, "bulk_action_running", False):
             return
         if self.session_load_error:
             self._show_session_error()
@@ -1947,15 +1975,25 @@ class DotReviewApp:
         if not self.database.is_file():
             messagebox.showerror("Fleet database unavailable", f"Cannot access:\n{self.database}")
             return
-        files = sorted(self.incoming.glob("*.pdf"), key=lambda path: path.name.lower())
-        if not files:
+        all_files = sorted(self.incoming.glob("*.pdf"), key=lambda path: path.name.lower())
+        if not all_files:
             messagebox.showinfo("No documents", f"No PDFs were found in:\n{self.incoming}")
             return
+        if target_files is None:
+            files = all_files
+        else:
+            available = {str(path): path for path in all_files}
+            files = [available[str(Path(path))] for path in target_files if str(Path(path)) in available]
+            if not files:
+                self.status_var.set("No newly published PDFs remain in Incoming to analyze.")
+                return
 
+        incoming_sources = {str(path) for path in all_files}
         retained = [
             item
             for item in self.model.results
-            if (
+            if item.get("source_file") in incoming_sources
+            or (
                 item.get("status") == "approved"
                 and approved_record_file_exists(item)
             )
@@ -1970,6 +2008,7 @@ class DotReviewApp:
         ]
         self.model = ReviewModel(retained)
         self.scanning = True
+        self.scanner_button.configure(state="disabled")
         self.scan_button.configure(state="disabled")
         self.progress.configure(maximum=len(files), value=0)
         self.progress_text.configure(text=f"0 of {len(files)}")
@@ -1977,14 +2016,48 @@ class DotReviewApp:
         self._refresh()
         threading.Thread(target=self._scan_worker, args=(files,), daemon=True).start()
 
+    def scan_documents(self) -> None:
+        if self.scanning or self.scanner_running or self.ocr_running or getattr(self, "bulk_action_running", False):
+            return
+        if not self.incoming.is_dir():
+            messagebox.showerror("Incoming folder unavailable", f"Cannot access:\n{self.incoming}")
+            return
+        self.scanner_running = True
+        self.scanner_button.configure(state="disabled")
+        self.scan_button.configure(state="disabled")
+        mode = self.scan_mode_var.get() or SCAN_MODE_COMBINED
+        self.status_var.set(f"Scanning from EPSON ES-400II at 600 DPI, full color, duplex • {mode}...")
+        threading.Thread(target=self._scanner_worker, args=(mode,), daemon=True).start()
+
+    def _scanner_worker(self, mode: str) -> None:
+        try:
+            scanned = scan_to_incoming(self.incoming, mode=mode)
+        except ScannerError as error:
+            self.events.put(("scanner_error", str(error)))
+            return
+        except Exception as error:
+            self.events.put(("scanner_error", f"Unexpected scanner error: {error}"))
+            return
+        self.events.put(("scanner_done", scanned))
+
     def _scan_worker(self, files: list[Path]) -> None:
-        approved_sources = {
-            item.get("source_file"): item for item in self.model.results if item.get("status") == "approved"
-        }
+        existing_sources = {item.get("source_file"): item for item in self.model.results}
         for index, pdf_path in enumerate(files, start=1):
-            existing = approved_sources.get(str(pdf_path))
-            if existing and self._source_matches_review_fingerprint(pdf_path, existing):
-                result = existing
+            existing = existing_sources.get(str(pdf_path))
+            has_snapshot = bool(
+                existing
+                and existing.get("source_mtime_ns") is not None
+                and existing.get("source_quick_signature")
+            )
+            quick_match = bool(existing and (not has_snapshot or source_snapshot_matches(pdf_path, existing)))
+            unchanged = bool(
+                existing
+                and quick_match
+                and self._source_matches_review_fingerprint(pdf_path, existing)
+            )
+            if unchanged:
+                self.events.put(("scan_progress", index, len(files), pdf_path.name, "unchanged"))
+                continue
             else:
                 try:
                     result = analyze_pdf(
@@ -2035,8 +2108,28 @@ class DotReviewApp:
                     self.progress_text.configure(text=f"{index} of {total}")
                     self.status_var.set(f"Analyzed {Path(result['source_file']).name}")
                     self._refresh()
+                elif event[0] == "scan_progress":
+                    _, index, total, filename, detail = event
+                    self.progress.configure(value=index)
+                    self.progress_text.configure(text=f"{index} of {total}")
+                    self.status_var.set(f"Checked {filename} • {detail}")
                 elif event[0] == "scan_done":
                     self._finish_scan()
+                elif event[0] == "scanner_done":
+                    _, scanned = event
+                    self.scanner_running = False
+                    self.scanner_button.configure(state="normal")
+                    self.scan_button.configure(state="normal")
+                    count = len(scanned)
+                    detail = Path(scanned[0]).name if count == 1 else f"{count} separate PDFs"
+                    self.status_var.set(f"Saved {detail}. Refreshing Incoming...")
+                    self.scan_incoming(scanned)
+                elif event[0] == "scanner_error":
+                    self.scanner_running = False
+                    self.scanner_button.configure(state="normal")
+                    self.scan_button.configure(state="normal")
+                    self.status_var.set(f"Scanning failed: {event[1]}")
+                    messagebox.showerror("Scanning failed", event[1])
                 elif event[0] == "import_done":
                     _, results = event
                     self.import_button.configure(state="normal")
@@ -2116,7 +2209,7 @@ class DotReviewApp:
                     _, index, total, filename, detail = event
                     self.progress.configure(value=index)
                     self.progress_text.configure(text=f"{index} of {total}")
-                    self.status_var.set(f"Bulk Not DOT {index} of {total}: {filename} • {detail}")
+                    self.status_var.set(f"Document removal {index} of {total}: {filename} • {detail}")
                 elif event[0] == "bulk_not_dot_done":
                     _, summary = event
                     self.bulk_action_running = False
@@ -2133,14 +2226,14 @@ class DotReviewApp:
                     self._refresh()
                     failures = summary["failed"]
                     self.status_var.set(
-                        f"Bulk Not DOT complete: {summary['completed']} archived, {failures} failed."
+                        f"Document removal complete: {summary['completed']} archived, {failures} failed."
                     )
                     if failures:
                         examples = "\n".join(
                             f"• {item['filename']}: {item['error']}" for item in summary["errors"][:5]
                         )
                         messagebox.showwarning(
-                            "Bulk Not DOT completed with failures",
+                            "Document removal completed with failures",
                             f"{failures} document(s) could not be archived. The remaining selections continued.\n\n{examples}",
                         )
                 elif event[0] == "sort_preview_done":
@@ -2159,6 +2252,7 @@ class DotReviewApp:
 
     def _finish_scan(self) -> None:
         self.scanning = False
+        self.scanner_button.configure(state="normal")
         self.scan_button.configure(state="normal")
         save_review_session(self.session_path, self.model.results)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -2745,11 +2839,11 @@ class DotReviewApp:
 
     def mark_selected_not_dot(self) -> None:
         if getattr(self, "bulk_action_running", False):
-            self.status_var.set("Wait for the bulk Not DOT action to finish.")
+            self.status_var.set("Wait for the document removal action to finish.")
             return
         selected = self._selected_results()
         if not selected:
-            messagebox.showinfo("Select a document", "Select a document to remove from the DOT workflow.")
+            messagebox.showinfo("Select a document", "Select a document to remove from the active workflow.")
             return
         ineligible = [
             result
@@ -2785,7 +2879,7 @@ class DotReviewApp:
         self.model.replace(not_dot)
         save_review_session(self.session_path, self.model.results)
         self.status_var.set(
-            f"Classified as {not_dot['non_dot_classification_label']} and removed from DOT workflow: {source_name}"
+            f"Classified as {not_dot['non_dot_classification_label']} and removed from the active workflow: {source_name}"
         )
         self._refresh_and_select_next(prior_order, not_dot["source_file"])
 
@@ -2799,8 +2893,8 @@ class DotReviewApp:
         label = NON_DOT_DOCUMENT_TYPES[classification]
         filter_name = self.filter_var.get()
         if not messagebox.askyesno(
-            "Confirm bulk Not DOT",
-            f"Classify and archive {len(candidates)} selected documents from {filter_name} as {label}?\n\n"
+            "Confirm document removal",
+            f"Remove and archive {len(candidates)} selected documents from {filter_name} as {label}?\n\n"
             "Each source fingerprint will be verified. Failures will be left in place and the batch will continue.",
             parent=self.root,
             icon="warning",
@@ -2818,7 +2912,7 @@ class DotReviewApp:
         self.import_button.configure(state="disabled")
         self.progress.configure(maximum=len(candidates), value=0)
         self.progress_text.configure(text=f"0 of {len(candidates)}")
-        self.status_var.set(f"Starting bulk Not DOT for {len(candidates)} documents...")
+        self.status_var.set(f"Starting removal for {len(candidates)} documents...")
         snapshot = [dict(item) for item in self.model.results]
         threading.Thread(
             target=self._bulk_not_dot_worker,
@@ -2874,7 +2968,7 @@ class DotReviewApp:
 
     def _choose_non_dot_classification(self, source_name: str) -> str | None:
         dialog = tk.Toplevel(self.root)
-        dialog.title("Classify Not DOT Document")
+        dialog.title("Remove Document")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         dialog.configure(background=DARK_THEME["surface"])
@@ -2896,7 +2990,7 @@ class DotReviewApp:
         selector.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 10))
         ttk.Label(
             dialog,
-            text="The PDF will be archived under Exceptions\\Not DOT.\n"
+            text="The PDF will be removed from the active workflow and archived under Exceptions\\Not DOT.\n"
             "This classification will be saved for future classifier training.",
             style="Muted.TLabel",
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 14))
@@ -2917,7 +3011,7 @@ class DotReviewApp:
         ttk.Button(dialog, text="Cancel", command=dialog.destroy).grid(
             row=3, column=0, sticky="e", padx=(18, 6), pady=(0, 18)
         )
-        ttk.Button(dialog, text="Classify and Archive", command=archive).grid(
+        ttk.Button(dialog, text="Remove and Archive", command=archive).grid(
             row=3, column=1, sticky="w", padx=(6, 18), pady=(0, 18)
         )
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)

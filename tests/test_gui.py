@@ -479,9 +479,16 @@ def test_review_inspector_exposes_existing_file_details_without_new_actions():
     assert "self.owner_status_var" in source
     assert "app.selection_count_var" in layout_source
     assert 'text="Approve and File Copy"' in layout_source
-    assert 'text="Save Correction"' in layout_source
     assert 'text="Mark Duplicate"' in layout_source
-    assert 'text="Not a DOT Document"' in layout_source
+    assert 'text="Remove Document"' in layout_source
+    for retired_control in (
+        'text="Save Correction"',
+        '"◌  OCR Selected"',
+        '"↗  Destination"',
+        '"＋  Asset"',
+        '"↶  Restore"',
+    ):
+        assert retired_control not in layout_source
 
 
 def test_scaled_sort_layout_keeps_reset_and_inspector_content_reachable():
@@ -543,6 +550,90 @@ def test_main_window_declares_four_primary_navigation_tabs():
     assert "_build_database_tab" in source
     assert "_build_settings_tab" in source
     assert "_build_binder_tab" in source
+
+
+def test_header_exposes_integrated_scan_and_separate_incoming_refresh_actions():
+    source = _gui_sources()
+
+    assert "app.scan_mode_var" in source
+    assert "SCAN_MODES" in source
+    assert 'text="Scan Mode"' in source
+    assert 'text="▣  Scan Documents"' in source
+    assert "command=app.scan_documents" in source
+    assert 'text="↻  Refresh Incoming"' in source
+    assert "command=app.scan_incoming" in source
+    assert "600 DPI color scan" in source
+
+
+def test_virtual_binder_viewer_exposes_print_current_document_action():
+    source = _gui_sources()
+
+    assert 'text="Print"' in source
+    assert "command=self.print_active_binder_document" in source
+
+
+def test_print_active_binder_document_launches_exact_current_pdf(monkeypatch, tmp_path):
+    current = tmp_path / "current.pdf"
+    current.write_bytes(b"%PDF-1.4\n")
+    launched = []
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.active_binder_pdf = current
+    app.binder_page_status_var = _Value()
+    monkeypatch.setattr(gui, "launch_pdf_print_dialog", lambda path: launched.append(Path(path)))
+
+    app.print_active_binder_document()
+
+    assert launched == [current]
+    assert app.binder_page_status_var.get() == f"Print dialog opened for {current.name}."
+
+
+def test_print_active_binder_document_rejects_missing_current_pdf(monkeypatch, tmp_path):
+    missing = tmp_path / "missing.pdf"
+    errors = []
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.active_binder_pdf = missing
+    app.binder_page_status_var = _Value()
+    monkeypatch.setattr(gui.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+    monkeypatch.setattr(gui, "launch_pdf_print_dialog", lambda _path: pytest.fail("print must not launch"))
+
+    app.print_active_binder_document()
+
+    assert errors == [("PDF unavailable", f"Cannot find the current Binder PDF:\n{missing}")]
+
+
+def test_scan_worker_reports_completed_pdf_for_queue_refresh(monkeypatch, tmp_path):
+    scanned = tmp_path / "Incoming" / "DocMarshal_Scan_20260813_160000.pdf"
+    calls = []
+    monkeypatch.setattr(
+        gui,
+        "scan_to_incoming",
+        lambda incoming, *, mode: calls.append((incoming, mode)) or [scanned],
+    )
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.incoming = scanned.parent
+    app.events = queue.Queue()
+
+    app._scanner_worker("Each page separate")
+
+    assert calls == [(scanned.parent, "Each page separate")]
+    assert app.events.get_nowait() == ("scanner_done", [scanned])
+
+
+def test_completed_scanner_batch_refreshes_only_newly_published_pdfs():
+    source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert "self.scan_incoming(scanned)" in source
+    assert "def scan_incoming(self, target_files" in source
+
+
+def test_sort_actions_use_general_remove_document_language():
+    layout_source = (Path(gui.__file__).parent / "ui_layout.py").read_text(encoding="utf-8")
+    gui_source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert 'text="Remove Document"' in layout_source
+    assert 'dialog.title("Remove Document")' in gui_source
+    assert 'text="Remove and Archive"' in gui_source
+    assert 'text="Not a DOT Document"' not in layout_source
 
 
 def test_approved_record_retention_requires_a_real_archive_or_legacy_source(tmp_path):
@@ -624,7 +715,78 @@ def test_scan_reuses_approved_record_only_when_fingerprint_still_matches(monkeyp
 
     app._scan_worker([source])
 
-    assert app.events.get_nowait()[1] is approved
+    progress = app.events.get_nowait()
+    assert progress[:2] == ("scan_progress", 1)
+    assert app.events.get_nowait() == ("scan_done",)
+
+
+def test_scan_reuses_unchanged_needs_review_analysis_without_reopening_pdf(monkeypatch, tmp_path):
+    import hashlib
+    from dotdocs.intake_index import source_snapshot
+
+    source = tmp_path / "Incoming" / "doc.pdf"
+    source.parent.mkdir()
+    source.write_bytes(b"stable searchable PDF content")
+    existing = {
+        "source_file": str(source),
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "status": "needs_review",
+        **source_snapshot(source),
+    }
+    monkeypatch.setattr(
+        gui,
+        "analyze_pdf",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not reanalyze")),
+    )
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.model = gui.ReviewModel([existing])
+    app.events = queue.Queue()
+    app.database = tmp_path / "fleet.db"
+    app.unit_root = tmp_path / "Fleet"
+    app.farm_unit_root = tmp_path / "Farm"
+    app.tool_root = tmp_path / "Tools"
+
+    app._scan_worker([source])
+
+    progress = app.events.get_nowait()
+    assert progress[:2] == ("scan_progress", 1)
+    assert app.events.get_nowait() == ("scan_done",)
+
+
+def test_scan_reanalyzes_same_size_same_mtime_file_when_full_fingerprint_changes(monkeypatch, tmp_path):
+    import hashlib
+    import os
+    from dotdocs.intake_index import source_snapshot
+
+    source = tmp_path / "Incoming" / "doc.pdf"
+    source.parent.mkdir()
+    original = b"A" * 80_000 + b"OLD" + b"Z" * 80_000
+    changed = b"A" * 80_000 + b"NEW" + b"Z" * 80_000
+    source.write_bytes(original)
+    existing = {
+        "source_file": str(source),
+        "source_sha256": hashlib.sha256(original).hexdigest(),
+        "status": "needs_review",
+        **source_snapshot(source),
+    }
+    original_mtime = source.stat().st_mtime_ns
+    source.write_bytes(changed)
+    os.utime(source, ns=(original_mtime, original_mtime))
+    analyzed = dict(existing, source_sha256=hashlib.sha256(changed).hexdigest())
+    calls = []
+    monkeypatch.setattr(gui, "analyze_pdf", lambda path, *_args, **_kwargs: calls.append(path) or analyzed)
+    app = gui.DotReviewApp.__new__(gui.DotReviewApp)
+    app.model = gui.ReviewModel([existing])
+    app.events = queue.Queue()
+    app.database = tmp_path / "fleet.db"
+    app.unit_root = tmp_path / "Fleet"
+    app.farm_unit_root = tmp_path / "Farm"
+    app.tool_root = tmp_path / "Tools"
+
+    app._scan_worker([source])
+
+    assert calls == [source]
+    assert app.events.get_nowait()[0] == "result"
 
 
 def test_open_pdf_uses_archived_or_legacy_approved_path_without_unsafe_fallback(monkeypatch, tmp_path):
@@ -672,10 +834,10 @@ def test_sort_and_virtual_binder_expose_import_ocr_zoom_and_sequence_controls():
     source = _gui_sources()
 
     assert "Import PDFs" in source
-    assert "OCR Selected" in source
-    assert "OCR All Needing OCR" in source
+    assert 'text="Run OCR"' in source
+    assert "OCR All Needing OCR" not in source
     assert "NON_DOT_DOCUMENT_TYPES" in source
-    assert 'text="Classify and Archive"' in source
+    assert 'text="Remove and Archive"' in source
     assert "classification=classification" in source
     assert "non_dot_classification_label" in source
     assert 'text="Zoom Out"' in source
@@ -1067,7 +1229,7 @@ def test_mark_not_dot_archives_and_hides_selected_document_from_active_view(monk
     assert app.model.replaced == marked
     assert saved
     assert app.filter_var.value == "All"
-    assert app.status_var.value == "Classified as MVR Auth and removed from DOT workflow: unrelated.pdf"
+    assert app.status_var.value == "Classified as MVR Auth and removed from the active workflow: unrelated.pdf"
     assert advanced == [((str(source),), str(source))]
 
 

@@ -8,6 +8,7 @@ import fitz
 from .assets import asset_folder_root
 from .analysis import classify_document, extract_controlling_date
 from .database import find_asset_owner
+from .intake_index import source_snapshot
 from .matching import match_units_in_text
 from .naming import build_filename, build_tool_filename, destination_subfolder
 from .normalization import normalize_unit
@@ -72,6 +73,7 @@ def analyze_pdf(
         "proposed_destination": None,
         "source_sha256": source_sha256,
         "source_size": source_size,
+        **source_snapshot(pdf_path),
     }
     if not text:
         result["reasons"].append("NO_SEARCHABLE_TEXT")

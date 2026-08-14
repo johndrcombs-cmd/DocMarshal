@@ -10,6 +10,13 @@ PAGE_SUFFIXES = ("", "PG2", "PG3", "PG4", "PG5", "PG6", "PG7", "PG8", "PG9", "PG
 FILTERS = ("Active", "All", "Ready", "Needs Review", "Approved", "Duplicates", "Not DOT", "Failed")
 
 
+class _RemovedControl:
+    """Compatibility shim for callbacks that still coordinate retired controls."""
+
+    def configure(self, **_kwargs) -> None:
+        pass
+
+
 def button_role_visuals(theme: dict) -> dict[str, tuple[str, str, str, str]]:
     """Return normal, hover, pressed, and border colors for each action role."""
     return {
@@ -314,7 +321,9 @@ def _section_header(parent, title: str, subtitle_var=None) -> ttk.Frame:
     return frame
 
 
-def _build_top_bar(app, app_name: str, theme: dict) -> None:
+def _build_header(app, app_name: str, theme: dict) -> None:
+    from .scanner import SCAN_MODE_COMBINED, SCAN_MODES
+
     header = ttk.Frame(app.root, style="Navigation.TFrame", padding=(16, 11))
     header.pack(fill="x", padx=8, pady=(8, 4))
     if app.header_icon_image is not None:
@@ -333,13 +342,35 @@ def _build_top_bar(app, app_name: str, theme: dict) -> None:
     ttk.Label(actions, text="●  READY", style="ReadyPill.TLabel").pack(
         side="left", padx=(0, 14)
     )
-    app.scan_button = RoundedButton(
+    scan_mode = ttk.Frame(actions, style="Navigation.TFrame")
+    scan_mode.pack(side="left", padx=(0, 8))
+    ttk.Label(scan_mode, text="Scan Mode", style="NavigationMuted.TLabel").pack(anchor="w")
+    app.scan_mode_var = tk.StringVar(value=SCAN_MODE_COMBINED)
+    app.scan_mode_box = ttk.Combobox(
+        scan_mode,
+        textvariable=app.scan_mode_var,
+        values=SCAN_MODES,
+        state="readonly",
+        width=27,
+        style="Rounded.TCombobox",
+    )
+    app.scan_mode_box.pack(anchor="w")
+    app.scanner_button = RoundedButton(
         actions,
-        text="↻  Scan Incoming Documents",
-        command=app.scan_incoming,
+        text="▣  Scan Documents",
+        command=app.scan_documents,
         theme=theme,
         role="main",
-        width=206,
+        width=166,
+    )
+    app.scanner_button.pack(side="left", padx=(0, 8))
+    app.scan_button = RoundedButton(
+        actions,
+        text="↻  Refresh Incoming",
+        command=app.scan_incoming,
+        theme=theme,
+        role="secondary",
+        width=166,
     )
     app.scan_button.pack(side="left")
 
@@ -382,7 +413,7 @@ def _build_command_row(app, theme: dict) -> None:
     app.progress_text = ttk.Label(processing, text="Ready", style="Glass.TLabel", width=10, anchor="center")
     app.progress_text.pack(side="left", padx=8)
     app.bulk_ocr_button = RoundedButton(
-        processing, text="OCR All Needing OCR", command=app.run_ocr_on_all,
+        processing, text="Run OCR", command=app.run_ocr_on_all,
         theme=theme, role="secondary", width=155,
     )
     app.bulk_ocr_button.pack(side="right")
@@ -396,13 +427,13 @@ def _build_command_row(app, theme: dict) -> None:
     )
     filter_box.pack(side="left", padx=(0, 5))
     filter_box.bind("<<ComboboxSelected>>", lambda _event: app._refresh_table())
+    app.ocr_button = _RemovedControl()
+    app.open_destination_button = _RemovedControl()
+    app.add_asset_button = _RemovedControl()
+    app.restore_button = _RemovedControl()
     specs = (
         ("import_button", "＋  Import", app.import_documents, "secondary", 92),
-        ("ocr_button", "◌  OCR Selected", app.run_ocr_on_selected, "secondary", 102),
         ("open_pdf_button", "▱  PDF", app.open_pdf, "utility", 68),
-        ("open_destination_button", "↗  Destination", app.open_destination, "utility", 104),
-        ("add_asset_button", "＋  Asset", app.add_new_asset, "utility", 78),
-        ("restore_button", "↶  Restore", app.restore_selected, "utility", 88),
     )
     for name, text, command, role, width in specs:
         button = RoundedButton(
@@ -523,13 +554,10 @@ def _build_inspector(app, document_type_choices, document_type_labels, theme: di
     actions = app.sort_action_footer_surface.content
     app.approve_button = RoundedButton(actions, text="Approve and File Copy", command=app.approve_selected, theme=theme, role="primary", width=250)
     app.approve_button.pack(fill="x", pady=(0, 6))
-    secondary = ttk.Frame(actions, style="ActionBar.TFrame")
-    secondary.pack(fill="x")
-    app.save_correction_button = RoundedButton(secondary, text="Save Correction", command=app.save_correction, theme=theme, role="secondary", width=118)
-    app.save_correction_button.pack(side="left", fill="x", expand=True, padx=(0, 3))
-    app.duplicate_button = RoundedButton(secondary, text="Mark Duplicate", command=app.mark_selected_duplicate, theme=theme, role="warning", width=118)
-    app.duplicate_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
-    app.not_dot_button = RoundedButton(actions, text="Not a DOT Document", command=app.mark_selected_not_dot, theme=theme, role="danger", width=250)
+    app.save_correction_button = _RemovedControl()
+    app.duplicate_button = RoundedButton(actions, text="Mark Duplicate", command=app.mark_selected_duplicate, theme=theme, role="warning", width=250)
+    app.duplicate_button.pack(fill="x")
+    app.not_dot_button = RoundedButton(actions, text="Remove Document", command=app.mark_selected_not_dot, theme=theme, role="danger", width=250)
     app.not_dot_button.pack(fill="x", pady=(6, 0))
 
     inspector_region = ttk.Frame(app.sort_inspector_pane, style="Borderless.TFrame")
@@ -613,7 +641,7 @@ def _build_inspector(app, document_type_choices, document_type_labels, theme: di
 
 def build_application_ui(app, *, app_name: str, theme: dict, document_type_choices, document_type_labels) -> None:
     app._configure_theme()
-    _build_top_bar(app, app_name, theme)
+    _build_header(app, app_name, theme)
     app.navigation = ttk.Notebook(app.root, style="Polished.TNotebook")
     app.navigation.pack(fill="both", expand=True, padx=8, pady=(0, 8))
     app.sort_tab, app.database_tab, app.settings_tab, app.binder_tab = (ttk.Frame(app.navigation) for _ in range(4))
@@ -630,7 +658,9 @@ def build_application_ui(app, *, app_name: str, theme: dict, document_type_choic
     _build_summary(app, theme)
     _build_command_row(app, theme)
 
-    app.status_var = tk.StringVar(value="Ready. Click Scan Incoming Documents to analyze PDFs.")
+    app.status_var = tk.StringVar(
+        value="Ready. Click Scan Documents for a new 600 DPI color scan, or Refresh Incoming to analyze saved PDFs."
+    )
     status = ttk.Frame(app.sort_tab, style="StatusBar.TFrame", padding=(12, 6))
     app.sort_status_bar = status
     status.pack(side="bottom", fill="x", padx=12, pady=(0, 8))

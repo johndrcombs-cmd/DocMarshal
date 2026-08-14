@@ -830,13 +830,42 @@ def test_mark_duplicate_archives_incoming_pdf_and_preserves_existing_production_
 
     archive = tmp_path / "Processed" / "Duplicates" / "scan.pdf"
     assert duplicate["status"] == "duplicate"
-    assert duplicate["duplicate_destination"] == str(destination)
+    assert duplicate["duplicate_destination"] is None
     assert duplicate["duplicate_archived_file"] == str(archive)
     assert archive.read_bytes() == b"%PDF-verified-source"
     assert not Path(result["source_file"]).exists()
     assert destination.read_bytes() == b"existing-production-document"
     entries = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert [entry["event"] for entry in entries] == ["duplicate_mark_started", "marked_duplicate"]
+
+
+def test_mark_duplicate_does_not_require_production_folder_for_doc12_unit_2(tmp_path):
+    result = _result(tmp_path)
+    source = Path(result["source_file"])
+    doc12 = source.with_name("doc12.pdf")
+    source.rename(doc12)
+    result["source_file"] = str(doc12)
+    result["subject_type"] = "tool"
+    result["subject_id"] = "S2F1710-87"
+
+    duplicate = mark_duplicate_document(
+        result,
+        unit="2",
+        document_type="CAL",
+        controlling_date="",
+        audit_path=tmp_path / "Review" / "audit.jsonl",
+        unit_folders_root=tmp_path / "missing-production-root",
+        incoming_folder=doc12.parent,
+        processed_folder=tmp_path / "Processed",
+        database_path=tmp_path / "missing-fleet.db",
+    )
+
+    archived = Path(duplicate["duplicate_archived_file"])
+    assert duplicate["status"] == "duplicate"
+    assert archived.is_file()
+    assert not doc12.exists()
+    assert duplicate.get("duplicate_destination") is None
+    assert not (tmp_path / "missing-production-root").exists()
 
 
 def test_mark_not_dot_moves_pdf_to_exceptions_and_audits_action(tmp_path):
@@ -961,23 +990,23 @@ def test_restore_archived_document_moves_pdf_back_to_active_review(tmp_path, arc
     assert events[-2:] == ["restore_to_active_started", "restored_to_active"]
 
 
-def test_mark_duplicate_rejects_when_expected_production_file_is_missing(tmp_path):
+def test_mark_duplicate_archives_when_expected_production_file_is_missing(tmp_path):
     result = _result(tmp_path)
 
-    with pytest.raises(ReviewValidationError, match="production file does not exist"):
-        mark_duplicate_document(
-            result,
-            unit="91",
-            document_type="REG",
-            controlling_date="08/31/2027",
-            audit_path=tmp_path / "Review" / "audit.jsonl",
-            unit_folders_root=_unit_root(tmp_path),
-            incoming_folder=Path(result["source_file"]).parent,
-            processed_folder=tmp_path / "Processed",
-        )
+    duplicate = mark_duplicate_document(
+        result,
+        unit="91",
+        document_type="REG",
+        controlling_date="08/31/2027",
+        audit_path=tmp_path / "Review" / "audit.jsonl",
+        unit_folders_root=_unit_root(tmp_path),
+        incoming_folder=Path(result["source_file"]).parent,
+        processed_folder=tmp_path / "Processed",
+    )
 
-    assert Path(result["source_file"]).is_file()
-    assert not (tmp_path / "Processed" / "Duplicates").exists()
+    assert duplicate["status"] == "duplicate"
+    assert not Path(result["source_file"]).exists()
+    assert Path(duplicate["duplicate_archived_file"]).is_file()
 
 
 def test_mark_duplicate_restores_incoming_pdf_if_final_audit_fails(monkeypatch, tmp_path):
