@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from pathlib import Path
 import subprocess
 
@@ -6,6 +7,7 @@ import pytest
 
 from dotdocs.scanner import (
     SCAN_MODE_BLANK_SEPARATORS,
+    SCAN_MODE_COMBINED,
     SCAN_MODE_EACH_PAGE,
     ScannerError,
     build_scan_command,
@@ -150,6 +152,78 @@ def test_each_page_mode_publishes_one_valid_pdf_per_page(monkeypatch, tmp_path):
     for path in outputs:
         with fitz.open(path) as document:
             assert document.page_count == 1
+
+
+def test_split_scan_rollback_preserves_replacement_file_it_does_not_own(monkeypatch, tmp_path):
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    executable = tmp_path / "NAPS2.Console.exe"
+    executable.write_bytes(b"exe")
+    replacement = b"replacement created by another process"
+    published = incoming / "first.pdf"
+    calls = 0
+
+    def fake_run(command, **_kwargs):
+        _multi_page_pdf(Path(command[-1]), ["First document", "Second document"])
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    def racing_publish(source, _incoming, _stem):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            source.rename(published)
+            published.write_bytes(replacement)
+            return published
+        raise ScannerError("injected second publication failure")
+
+    monkeypatch.setattr("dotdocs.scanner.subprocess.run", fake_run)
+    monkeypatch.setattr("dotdocs.scanner._move_to_unique", racing_publish)
+    monkeypatch.setattr(
+        "dotdocs.scanner._lock_verified_owned_file",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    with pytest.raises(ScannerError, match="injected"):
+        scan_to_incoming(
+            incoming,
+            executable=executable,
+            timestamp="20260813_160000",
+            mode=SCAN_MODE_EACH_PAGE,
+        )
+
+    assert published.read_bytes() == replacement
+
+
+@pytest.mark.parametrize("mode", [SCAN_MODE_COMBINED, SCAN_MODE_EACH_PAGE])
+def test_scan_rejects_output_replaced_immediately_after_publication(monkeypatch, tmp_path, mode):
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    executable = tmp_path / "NAPS2.Console.exe"
+    executable.write_bytes(b"exe")
+    replacement = b"replacement created before publication completed"
+    published = incoming / "replaced.pdf"
+
+    def fake_run(command, **_kwargs):
+        _multi_page_pdf(Path(command[-1]), ["First document", "Second document"])
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    def replace_before_return(source, _incoming, _stem):
+        source.rename(published)
+        published.write_bytes(replacement)
+        return published
+
+    monkeypatch.setattr("dotdocs.scanner.subprocess.run", fake_run)
+    monkeypatch.setattr("dotdocs.scanner._move_to_unique", replace_before_return)
+
+    with pytest.raises(ScannerError):
+        scan_to_incoming(
+            incoming,
+            executable=executable,
+            timestamp="20260813_160000",
+            mode=mode,
+        )
+
+    assert published.read_bytes() == replacement
 
 
 def test_blank_separator_mode_removes_blank_pages_and_publishes_document_groups(monkeypatch, tmp_path):

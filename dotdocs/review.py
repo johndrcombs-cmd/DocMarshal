@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import shutil
 import hashlib
@@ -157,6 +158,168 @@ def _delete_owned_quarantine_windows(
         ):
             raise OSError(ctypes.get_last_error(), f"Could not mark rollback quarantine for deletion: {path}")
     return True
+
+
+@contextmanager
+def _lock_verified_owned_file(
+    path: Path,
+    identity: os.stat_result | None,
+    expected_hash: str,
+    expected_size: int,
+    *,
+    delete_access: bool = False,
+    verify_on_exit: bool = True,
+):
+    if os.name != "nt":
+        with path.open("rb") as owned_file:
+            locked_identity = identity or os.fstat(owned_file.fileno())
+            _verify_locked_owned_file(owned_file, path, locked_identity, expected_hash, expected_size)
+            yield owned_file
+            if verify_on_exit:
+                _verify_locked_owned_file(owned_file, path, locked_identity, expected_hash, expected_size)
+        return
+
+    generic_read = 0x80000000
+    delete_access_flag = 0x00010000
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    native_handle = kernel32.CreateFileW(
+        str(path),
+        generic_read | (delete_access_flag if delete_access else 0),
+        0,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    if native_handle == invalid_handle_value:
+        raise OSError(ctypes.get_last_error(), f"Could not exclusively lock owned file: {path}")
+    try:
+        descriptor = _win32_open_osfhandle(native_handle)
+    except Exception:
+        kernel32.CloseHandle(native_handle)
+        raise
+    try:
+        owned_file = _fdopen_binary_read(descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+    with owned_file:
+        locked_identity = identity or os.fstat(owned_file.fileno())
+        _verify_locked_owned_file(owned_file, path, locked_identity, expected_hash, expected_size)
+        yield owned_file
+        if verify_on_exit:
+            _verify_locked_owned_file(owned_file, path, locked_identity, expected_hash, expected_size)
+
+
+def _verify_locked_owned_file(
+    handle,
+    path: Path,
+    identity: os.stat_result,
+    expected_hash: str,
+    expected_size: int,
+) -> None:
+    current = os.fstat(handle.fileno())
+    handle.seek(0)
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    if (
+        not os.path.samestat(identity, current)
+        or current.st_size != expected_size
+        or digest.hexdigest() != expected_hash
+    ):
+        raise ApprovalError(f"The owned file changed before the operation completed: {path}")
+
+
+def _delete_locked_owned_file(handle, path: Path) -> None:
+    if os.name != "nt":
+        if not os.path.samestat(os.fstat(handle.fileno()), path.stat()):
+            raise ApprovalError(f"Refusing to delete a path that no longer identifies the locked file: {path}")
+        path.unlink()
+        return
+
+    import msvcrt
+
+    file_disposition_info = 4
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    disposition = _FILE_DISPOSITION_INFO(True)
+    if not kernel32.SetFileInformationByHandle(
+        msvcrt.get_osfhandle(handle.fileno()),
+        file_disposition_info,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        raise OSError(ctypes.get_last_error(), f"Could not retire locked owned file: {path}")
+
+
+def _rename_locked_owned_file(handle, destination: Path) -> None:
+    if os.name != "nt":
+        source = Path(handle.name)
+        if not os.path.samestat(os.fstat(handle.fileno()), source.stat()):
+            raise ApprovalError(f"Refusing to rename a path that no longer identifies the locked file: {source}")
+        source.rename(destination)
+        return
+
+    import msvcrt
+
+    file_rename_info = 3
+
+    class _FILE_RENAME_INFO(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOLEAN),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * 1),
+        ]
+
+    encoded_name = str(destination.resolve()).encode("utf-16-le")
+    name_offset = _FILE_RENAME_INFO.FileName.offset
+    buffer = ctypes.create_string_buffer(
+        name_offset + len(encoded_name) + ctypes.sizeof(wintypes.WCHAR)
+    )
+    rename_info = ctypes.cast(buffer, ctypes.POINTER(_FILE_RENAME_INFO)).contents
+    rename_info.ReplaceIfExists = False
+    rename_info.RootDirectory = None
+    rename_info.FileNameLength = len(encoded_name)
+    ctypes.memmove(ctypes.addressof(buffer) + name_offset, encoded_name, len(encoded_name))
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    if not kernel32.SetFileInformationByHandle(
+        msvcrt.get_osfhandle(handle.fileno()),
+        file_rename_info,
+        buffer,
+        len(buffer),
+    ):
+        raise OSError(ctypes.get_last_error(), f"Could not rename locked owned file to: {destination}")
 
 
 def _remove_owned_file_via_quarantine(

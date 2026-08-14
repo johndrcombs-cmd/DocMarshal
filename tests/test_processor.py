@@ -1,8 +1,12 @@
+from pathlib import Path
+
 import fitz
+import pytest
 from openpyxl import Workbook
 
 from dotdocs.database import import_fleet_workbook
-from dotdocs.processor import analyze_pdf, find_unit_folder
+import dotdocs.processor as processor
+from dotdocs.processor import SourceChangedDuringAnalysisError, analyze_pdf, find_unit_folder
 from dotdocs.tools_database import create_tool
 
 
@@ -16,6 +20,65 @@ def _database(tmp_path):
     workbook.save(workbook_path)
     import_fleet_workbook(workbook_path, database_path)
     return database_path
+
+
+def test_analysis_rejects_source_that_changes_between_snapshot_and_completion(monkeypatch, tmp_path):
+    database = _database(tmp_path)
+    unit_root = tmp_path / "Units"
+    unit_root.mkdir()
+    pdf = tmp_path / "scan.pdf"
+    _searchable_pdf(
+        pdf,
+        "SERVICE OKLAHOMA CERTIFICATE OF REGISTRATION VIN 1GB3KZBK9AF141680 Reg Expires 3/31/2026",
+    )
+    real_fingerprint = processor.source_fingerprint
+    source_reads = 0
+
+    def changing_fingerprint(path):
+        nonlocal source_reads
+        fingerprint = real_fingerprint(path)
+        if Path(path) == pdf:
+            source_reads += 1
+            if source_reads >= 3:
+                return ("0" * 64, fingerprint[1])
+        return fingerprint
+
+    monkeypatch.setattr(processor, "source_fingerprint", changing_fingerprint)
+
+    with pytest.raises(SourceChangedDuringAnalysisError):
+        analyze_pdf(pdf, database, unit_root)
+
+
+def test_analysis_intake_metadata_is_derived_from_immutable_snapshot(monkeypatch, tmp_path):
+    pdf = tmp_path / "registration.pdf"
+    _searchable_pdf(
+        pdf,
+        "SERVICE OKLAHOMA CERTIFICATE OF REGISTRATION VIN 1GB3KZBK9AF141680 Reg Expires 3/31/2026",
+    )
+    database = _database(tmp_path)
+    unit_root = tmp_path / "units"
+    (unit_root / "Unit_101" / "Registration").mkdir(parents=True)
+    original_snapshot = processor.source_snapshot
+    snapshot_paths = []
+
+    def poison_live_snapshot(path):
+        snapshot_paths.append(Path(path))
+        if Path(path) == pdf:
+            return {
+                "source_size": 1,
+                "source_mtime_ns": 2,
+                "source_quick_signature": "transient-live-version",
+            }
+        return original_snapshot(path)
+
+    monkeypatch.setattr(processor, "source_snapshot", poison_live_snapshot)
+
+    result = analyze_pdf(pdf, database, unit_root)
+
+    assert pdf not in snapshot_paths
+    assert result["source_size"] == pdf.stat().st_size
+    assert result["source_mtime_ns"] == pdf.stat().st_mtime_ns
+    assert result["source_quick_signature"] != "transient-live-version"
 
 
 def _searchable_pdf(path, text):

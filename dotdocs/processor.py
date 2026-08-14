@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import hashlib
+import shutil
+import tempfile
 
 import fitz
 
@@ -13,6 +16,10 @@ from .matching import match_units_in_text
 from .naming import build_filename, build_tool_filename, destination_subfolder
 from .normalization import normalize_unit
 from .tools_database import match_tool_in_text
+
+
+class SourceChangedDuringAnalysisError(RuntimeError):
+    pass
 
 
 def extract_pdf_text(pdf_path: str | Path) -> str:
@@ -47,19 +54,22 @@ def find_unit_folder(unit_folders_root: str | Path, unit: str) -> Path | None:
     return candidate
 
 
-def analyze_pdf(
+def _analyze_pdf_snapshot(
     pdf_path: str | Path,
     database_path: str | Path,
     unit_folders_root: str | Path,
     *,
+    source_file: Path,
+    source_sha256: str,
+    source_size: int,
+    source_state: dict,
     farm_asset_folders_root: str | Path | None = None,
     tool_folders_root: str | Path | None = None,
 ) -> dict:
     pdf_path = Path(pdf_path)
     text = extract_pdf_text(pdf_path)
-    source_sha256, source_size = source_fingerprint(pdf_path)
     result = {
-        "source_file": str(pdf_path),
+        "source_file": str(source_file),
         "status": "needs_review",
         "reasons": [],
         "unit": None,
@@ -73,7 +83,7 @@ def analyze_pdf(
         "proposed_destination": None,
         "source_sha256": source_sha256,
         "source_size": source_size,
-        **source_snapshot(pdf_path),
+        **source_state,
     }
     if not text:
         result["reasons"].append("NO_SEARCHABLE_TEXT")
@@ -136,3 +146,61 @@ def analyze_pdf(
             result["status"] = "ready_for_review"
 
     return result
+
+
+@contextmanager
+def _stable_source_copy(source: Path):
+    with tempfile.TemporaryDirectory(prefix="docmarshal-analysis-") as temporary_folder:
+        snapshot = Path(temporary_folder) / source.name
+        before_state = source.stat()
+        before = source_fingerprint(source)
+        shutil.copyfile(source, snapshot)
+        snapshot_fingerprint = source_fingerprint(snapshot)
+        after_copy = source_fingerprint(source)
+        after_copy_state = source.stat()
+        if (
+            before != snapshot_fingerprint
+            or after_copy != snapshot_fingerprint
+            or before_state.st_size != after_copy_state.st_size
+            or before_state.st_mtime_ns != after_copy_state.st_mtime_ns
+        ):
+            raise SourceChangedDuringAnalysisError(
+                "The source PDF changed while DocMarshal was preparing it for analysis."
+            )
+        yield snapshot, snapshot_fingerprint, before_state
+
+
+def analyze_pdf(
+    pdf_path: str | Path,
+    database_path: str | Path,
+    unit_folders_root: str | Path,
+    *,
+    farm_asset_folders_root: str | Path | None = None,
+    tool_folders_root: str | Path | None = None,
+) -> dict:
+    source = Path(pdf_path)
+    with _stable_source_copy(source) as (snapshot, fingerprint, initial_state):
+        source_state = source_snapshot(snapshot)
+        source_state["source_mtime_ns"] = initial_state.st_mtime_ns
+        result = _analyze_pdf_snapshot(
+            snapshot,
+            database_path,
+            unit_folders_root,
+            source_file=source,
+            source_sha256=fingerprint[0],
+            source_size=fingerprint[1],
+            source_state=source_state,
+            farm_asset_folders_root=farm_asset_folders_root,
+            tool_folders_root=tool_folders_root,
+        )
+        final_fingerprint = source_fingerprint(source)
+        final_state = source.stat()
+        if (
+            final_fingerprint != fingerprint
+            or final_state.st_size != initial_state.st_size
+            or final_state.st_mtime_ns != initial_state.st_mtime_ns
+        ):
+            raise SourceChangedDuringAnalysisError(
+                "The source PDF changed before analysis completed."
+            )
+        return result

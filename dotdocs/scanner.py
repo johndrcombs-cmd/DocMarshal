@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from datetime import datetime
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -8,6 +10,8 @@ import subprocess
 import tempfile
 
 import fitz
+
+from .review import _file_identity, _lock_verified_owned_file, _remove_owned_file_via_quarantine
 
 
 DEFAULT_NAPS2_CONSOLE = Path(r"C:\Program Files\NAPS2\NAPS2.Console.exe")
@@ -20,6 +24,16 @@ SCAN_MODES = (SCAN_MODE_COMBINED, SCAN_MODE_EACH_PAGE, SCAN_MODE_BLANK_SEPARATOR
 
 class ScannerError(RuntimeError):
     pass
+
+
+def _fingerprint(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
 
 
 def find_naps2_console() -> Path:
@@ -89,6 +103,23 @@ def _move_to_unique(source: Path, incoming: Path, stem: str) -> Path:
         return destination
 
 
+def _rollback_published_file(
+    destination: Path,
+    identity: os.stat_result,
+    expected_fingerprint: tuple[str, int],
+) -> str | None:
+    try:
+        _remove_owned_file_via_quarantine(
+            destination,
+            identity,
+            expected_fingerprint[0],
+            expected_fingerprint[1],
+        )
+        return None
+    except Exception as error:
+        return str(error)
+
+
 def _page_is_blank(page: fitz.Page) -> bool:
     pixmap = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), colorspace=fitz.csGRAY, alpha=False)
     samples = memoryview(pixmap.samples)
@@ -128,29 +159,69 @@ def _write_page_group(source: Path, page_indexes: list[int], output: Path) -> No
 def _publish_scan_outputs(source: Path, incoming: Path, timestamp: str, mode: str, staging: Path) -> list[Path]:
     groups = _page_groups(source, mode)
     if mode == SCAN_MODE_COMBINED:
+        expected_fingerprint = _fingerprint(source)
+        expected_identity = _file_identity(source)
         destination = _move_to_unique(source, incoming, f"DocMarshal_Scan_{timestamp}")
-        _validate_scanned_pdf(destination)
-        return [destination]
+        try:
+            with _lock_verified_owned_file(
+                destination,
+                expected_identity,
+                expected_fingerprint[0],
+                expected_fingerprint[1],
+            ):
+                return [destination]
+        except Exception as error:
+            rollback_error = _rollback_published_file(
+                destination,
+                expected_identity,
+                expected_fingerprint,
+            )
+            if rollback_error:
+                raise ScannerError(f"{error}; {rollback_error}") from error
+            raise
 
     staged_outputs: list[Path] = []
-    published: list[Path] = []
+    published: list[tuple[Path, os.stat_result, tuple[str, int]]] = []
     try:
         for sequence, pages in enumerate(groups, start=1):
             staged = staging / f"split-{sequence:03d}.pdf"
             _write_page_group(source, pages, staged)
             _validate_scanned_pdf(staged)
             staged_outputs.append(staged)
-        for sequence, staged in enumerate(staged_outputs, start=1):
-            destination = _move_to_unique(
-                staged,
-                incoming,
-                f"DocMarshal_Scan_{timestamp}_{sequence:03d}",
-            )
-            published.append(destination)
-        return published
-    except Exception:
-        for destination in published:
-            destination.unlink(missing_ok=True)
+        with ExitStack() as publication_locks:
+            for sequence, staged in enumerate(staged_outputs, start=1):
+                expected_fingerprint = _fingerprint(staged)
+                expected_identity = _file_identity(staged)
+                destination = _move_to_unique(
+                    staged,
+                    incoming,
+                    f"DocMarshal_Scan_{timestamp}_{sequence:03d}",
+                )
+                published.append((destination, expected_identity, expected_fingerprint))
+                publication_locks.enter_context(
+                    _lock_verified_owned_file(
+                        destination,
+                        expected_identity,
+                        expected_fingerprint[0],
+                        expected_fingerprint[1],
+                    )
+                )
+            return [destination for destination, _identity, _fingerprint_value in published]
+    except Exception as error:
+        rollback_errors: list[str] = []
+        for destination, expected_identity, expected_fingerprint in published:
+            try:
+                rollback_error = _rollback_published_file(
+                    destination,
+                    expected_identity,
+                    expected_fingerprint,
+                )
+                if rollback_error:
+                    rollback_errors.append(rollback_error)
+            except OSError as rollback_error:
+                rollback_errors.append(f"rollback failed for {destination}: {rollback_error}")
+        if rollback_errors:
+            raise ScannerError(f"{error}; " + "; ".join(rollback_errors)) from error
         raise
     finally:
         for staged in staged_outputs:
